@@ -1,0 +1,17 @@
+# 编译产物
+esp32s3_camera_serial/build/
+esp32s3_camera_serial/build_out/
+host/__pycache__/
+*.bin
+*.elf
+
+# Arduino 本地工具链（体积大，无需入库）
+tools/*.zip
+tools/package_esp32_index_local.json
+tools/arduino-cli.exe
+
+# 资料解压产物与原始压缩包可留，但很大，按需是否入库
+资料/extracted/
+
+# 截图输出
+esp32s3_camera_serial/host/shots/
