@@ -15,3 +15,20 @@ tools/arduino-cli.exe
 
 # 截图输出
 esp32s3_camera_serial/host/shots/
+
+# PlatformIO 构建产物与依赖（体积大，无需入库）
+esp32s3_camera_pio/.pio/
+esp32s3_camera_pio/.pio/libdeps/
+
+# 旧串口工程残留构建/日志
+esp32s3_camera_serial/build_*/
+esp32s3_camera_serial/buildj/
+esp32s3_camera_serial/buildn/
+esp32s3_camera_serial/buildn_verbose.log
+esp32s3_camera_serial/verbose.log
+esp32s3_camera_serial/vl.log
+esp32s3_camera_serial/vl_src.log
+
+# 上位机产物
+esp32s3_camera_serial/host/__pycache__/
+esp32s3_camera_serial/host/photos/

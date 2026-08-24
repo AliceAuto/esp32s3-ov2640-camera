@@ -9,13 +9,22 @@ OV2640 实时预览 + 动态分辨率切换 + 拍照。
 用法: python live_capture.py COM7 [baud]
 快捷键: Ctrl+Q 退出
 """
-import sys, time, threading, queue, os, re
+import sys, time, threading, queue, os, re, socket, io
 import serial
 from PIL import Image, ImageTk
 import tkinter as tk
 
-port = sys.argv[1] if len(sys.argv) > 1 else "COM7"
-baud = int(sys.argv[2]) if len(sys.argv) > 2 else 2000000
+# ---- 传输通道选择 ----
+#   串口: python live_capture.py COM7 [baud]
+#   WiFi: python live_capture.py --wifi [host] [port]   (host 默认 192.168.4.1)
+_args = [x for x in sys.argv[1:] if x != "--wifi"]
+USE_WIFI = "--wifi" in sys.argv
+if USE_WIFI:
+    port = _args[0] if _args else "192.168.4.1"
+    baud = int(_args[1]) if len(_args) > 1 else 3333
+else:
+    port = _args[0] if _args else "COM7"
+    baud = int(_args[1]) if len(_args) > 1 else 2000000
 
 BEGIN = b"FRAME_BEGIN\n"
 END = b"FRAME_END\n"
@@ -35,7 +44,7 @@ PHOTO_CHOICES = ["VGA", "SVGA", "XGA", "UXGA"]  # 拍照可选
 out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photos")
 
 # 预览当前尺寸(线程共享, 用锁保护)；photo_cfg 记录当前选中的拍照分辨率
-preview = {"code": "q", "w": 160, "h": 120}
+preview = {"code": "t", "w": 320, "h": 240}
 photo_cfg = {"code": "u"}
 photo_req = {"active": False, "w": 0, "h": 0, "rgb": None, "done": False}
 q = queue.Queue()
@@ -61,10 +70,24 @@ def convert_rgb(frame):
     return bytes(rgb)
 
 
-_FRAME_RE = re.compile(rb'FRAME_BEGIN\nSIZE (\d+) (\d+)\n(.*?)FRAME_END\n', re.S)
+_FRAME_RE = re.compile(rb'FRAME_BEGIN\nSIZE (\d+) (\d+) (\w+)\n(.*?)FRAME_END\n', re.S)
 
 
 def open_serial():
+    """创建传输连接：串口用 serial.Serial，WiFi 用 socket 封装成同名接口。
+    返回 None 表示重试超时(上层 stop)。"""
+    if USE_WIFI:
+        host, portn = port, baud
+        for _ in range(60):
+            if stop.is_set():
+                return None
+            try:
+                s = socket.create_connection((host, portn), timeout=4)
+                s.settimeout(0.05)
+                return TcpIo(s)
+            except Exception:
+                time.sleep(1.0)   # WiFi: 板子可能还在复位/开机, 慢速重试
+        return None
     for _ in range(300):
         if stop.is_set():
             return None
@@ -74,9 +97,51 @@ def open_serial():
             s.rts = False
             s.reset_input_buffer()
             return s
-        except Exception as e:
+        except Exception:
             time.sleep(0.5)
     return None
+
+
+class TcpIo:
+    """把 socket 包装成与 serial.Serial 同名接口(read/write/flush/close/reset_input_buffer)。"""
+    def __init__(self, s):
+        self.s = s
+    def read(self, n):
+        try:
+            return self.s.recv(n)
+        except socket.timeout:
+            return b""
+    def write(self, b):
+        if isinstance(b, str):
+            b = b.encode()
+        if not b:
+            return 0
+        try:
+            self.s.sendall(b)
+            return len(b)
+        except OSError:
+            raise
+    def flush(self):
+        pass
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+    def reset_input_buffer(self):
+        """丢弃当前已收到但未处理的字节。"""
+        try:
+            self.s.setblocking(False)
+            while True:
+                if not self.s.recv(65536):
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                self.s.setblocking(True)
+            except Exception:
+                pass
 
 
 def resync_board():
@@ -151,24 +216,40 @@ def reader():
             if not m:
                 break
             w, h = int(m.group(1)), int(m.group(2))
-            body = m.group(3)
+            fmt = m.group(3).decode('ascii', 'ignore')      # JPG 或 RGB
+            body = m.group(4)
             fb_len = w * h * 2
             end = m.end()
             with state_lock:
                 pw, ph = preview["w"], preview["h"]
                 want_photo = photo_req.get("active")
                 pw_, ph_ = photo_req["w"], photo_req["h"]
-            if len(body) >= fb_len:
-                frame = body[:fb_len]
+            ok = False
+            frame_rgb = None
+            if fmt == "JPG":
+                # JPEG: 长度不定，直接整体解码（校验 JPEG 头尾）
+                if len(body) > 100 and body[:2] == b"\xff\xd8" and body[-2:] == b"\xff\xd9":
+                    ok = True
+                    try:
+                        frame_rgb = Image.open(io.BytesIO(body)).convert("RGB")
+                    except Exception:
+                        ok = False
+            else:
+                # RGB565 big-endian: 长度需等于 w*h*2
+                ok = len(body) >= fb_len
+                if ok:
+                    frame_rgb = Image.frombytes("RGB", (w, h),
+                                                convert_rgb(bytes(body[:fb_len])))
+            if ok and frame_rgb:
                 if (w, h) == (pw, ph):
-                    q.put(convert_rgb(bytes(frame)))
+                    q.put((frame_rgb, w, h))
                     frame_count[0] += 1
                 elif want_photo and (w, h) == (pw_, ph_):
                     with state_lock:
-                        photo_req["rgb"] = convert_rgb(bytes(frame))
+                        photo_req["rgb"] = frame_rgb
                         photo_req["done"] = True
                         photo_req["active"] = False
-                    print(f"收到照片帧 {w}x{h}", flush=True)
+                    print(f"收到照片帧 {w}x{h} {fmt}", flush=True)
                 last_frame_time = time.time()
             pos = end
         buf = bytearray(s[pos:])
@@ -251,7 +332,7 @@ def poll_photo(_=None):
         os.makedirs(out_dir, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         path = os.path.join(out_dir, f"photo_{ts}_{w}x{h}.png")
-        Image.frombytes("RGB", (w, h), rgb).save(path)
+        rgb.save(path)
         print(f"已保存照片 {w}x{h} -> {path}", flush=True)
         status_lbl.config(text=f"已保存 {w}x{h} -> {os.path.basename(path)}")
         with state_lock:
@@ -266,9 +347,7 @@ def render():
     except queue.Empty:
         data = None
     if data:
-        with state_lock:
-            w, h = preview["w"], preview["h"]
-        img = Image.frombytes("RGB", (w, h), data)
+        img, w, h = data
         scale = max(1, 640 // max(w, 1))
         big = img.resize((w * scale, h * scale), Image.NEAREST)
         photo_image = ImageTk.PhotoImage(big)
@@ -283,7 +362,7 @@ root.title(f"OV2640 实时预览+动态拍照 [{port}@{baud}]")
 
 top = tk.Frame(root); top.pack(fill="x", padx=6, pady=6)
 tk.Label(top, text="预览:").pack(side="left")
-preview_var = tk.StringVar(value="QQVGA")
+preview_var = tk.StringVar(value="QVGA")
 tk.OptionMenu(top, preview_var, *PREVIEW_CHOICES, command=set_preview).pack(side="left", padx=3)
 tk.Label(top, text="拍照:").pack(side="left", padx=(12, 0))
 photo_var = tk.StringVar(value="UXGA")

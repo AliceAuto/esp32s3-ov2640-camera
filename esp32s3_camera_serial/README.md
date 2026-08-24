@@ -10,8 +10,8 @@
 | --- | --- |
 | 传感器 | OV2640（200万像素 DVP 摄像头） |
 | 主控 | ESP32-S3（8MB PSRAM，片外帧缓冲） |
-| 图像格式 | RGB565（big-endian 输出） |
-| 数据传输 | 串口 UART0（GPIO43/44），波特率 **2,000,000** |
+| 图像格式 | **JPEG（默认，高压缩）/ RGB565（big-endian）可切换** |
+| 数据传输 | WiFi TCP/UDP（局域网 IP:3333）或 串口 UART0 2,000,000 baud |
 | 预览分辨率 | 默认 QQVGA 160×120（可切 QVGA/VGA） |
 | 拍照分辨率 | 默认 **UXGA 1600×1200**（可切 VGA/SVGA/XGA/UXGA） |
 | 帧缓冲 | PSRAM，按分辨率自适应 1/2 缓冲 |
@@ -123,13 +123,40 @@ $cli = "d:\Projects\ov2640\tools\arduino-cli.exe"
 - **必须启用 `PSRAM=opi`**（8MB OPI PSRAM），否则大分辨率帧缓冲 malloc 失败，初始化报错。
 - 设备使用 **UART0（CH343）** 而非 USB-CDC，端口号为 `COM7`，硬件复位重刷固件可重启板子。
 
+> **⚠️ arduino-cli 路径无法解锁 JPEG**：它会链接预编译的 `libespressif__esp32-camera.a`，JPEG 模式下出空帧（FB-OVF）。**JPEG 版本改用 PlatformIO 源码编译**（见 4.2）。
+
+---
+
+## 4.2 构建与烧录（PlatformIO，JPEG 解锁路线）
+
+> PlatformIO 从源码编译 `espressif/esp32-camera`，彻底绕过预编译库的 JPEG 空帧缺陷。工程在 `d:\Projects\ov2640\esp32s3_camera_pio\`。
+
+```powershell
+$pio = "C:\Users\27427\AppData\Local\Programs\Python\Python311\Scripts\pio.exe"
+
+# 编译（首次会自动下载 espressif32 平台 + 工具链 + 源码编译 esp32-camera）
+& $pio run -d d:\Projects\ov2640\esp32s3_camera_pio
+
+# 上传到 COM7
+& $pio run -t upload -d d:\Projects\ov2640\esp32s3_camera_pio
+```
+
+- 关键配置（`esp32s3_camera_pio\platformio.ini`）：
+  - `board = esp32-s3-devkitc-1`，`board_build.arduino.memory_type = qio_opi`（8MB OPI PSRAM）。
+  - `lib_deps = espressif/esp32-camera`：**从源码编译**（非预编译 `.a`）。
+  - `build_flags`：`-DBOARD_HAS_PSRAM`、`-DARDUINO_USB_CDC_ON_BOOT=0`。
+- 源码结构：`src/main.cpp` = 原 `.ino` 迁移，`#define PIX_FORMAT PIXFORMAT_JPEG` 启用 JPEG；改回 `PIXFORMAT_RGB565` 即 RGB 基线。`apply_color_calib()` 里 `set_quality(s,10)` 把 JPEG 画质拉满。
+- **第一台机器安装 PlatformIO 首次编译需下载约 700MB 工具链，务必开代理/镜像加速**，否则耗时极长。
+- 若报缺 `freertos/FreeRTOS.h` 等 IDF 头文件：是 `framework-arduinoespressif32` 包下载不完整，删 `~/.platformio/packages/framework-arduinoespressif32` 后重跑 `pio run` 让其重下。
+
 ---
 
 ## 5. 上位机脚本（`host/`）
 
 | 脚本 | 用途 |
 | ---- | ---- |
-| **`live_capture.py`** | **主程序**：实时预览 GUI + 下拉切换预览/拍照分辨率 + 一键拍照存图 + **自动重连**。用法：`python live_capture.py COM7 [baud]` |
+| **`live_capture.py`** | **主程序**：实时预览 GUI + 下拉切换预览/拍照分辨率 + 一键拍照存图 + **自动重连**。用法：`python live_capture.py COM7 [baud]` 或 `--wifi <IP> 3333` |
+| **`udp_capture.py`** | **JPEG 高帧率预览**：走 UDP 通道（丢帧不重传）+ JPEG 解码，帧率明显高于 TCP。用法：`python udp_capture.py --wifi <IP> 3333` |
 | `verify_switch.py` | 自动验证：预览切 QVGA、拍照切 UXGA、切回 QQVGA 的无头验证脚本 |
 | `hi_res_capture.py` | UXGA 无头抓拍教程脚本 |
 | `rgb_capture.py` / `raw_save.py` / `raw_monitor.py` | RGB565 / 原始字节采集诊断 |
@@ -140,6 +167,7 @@ $cli = "d:\Projects\ov2640\tools\arduino-cli.exe"
 ### live_capture.py 关键解析规则（维护者必读）
 
 - **RGB565 必须 big-endian 解析**：`v = (frame[o] << 8) | frame[o+1]`。用 little-endian 会整体花屏。切勿改回。
+- **格式随帧头携带**：`SIZE <w> <h> <JPG|RGB>`。`JPG` 直接 `Image.open(BytesIO).convert("RGB")`（校验 `FF D8`/`FF D9`）；`RGB` 按 `w*h*2` 取帧体做 big-endian 转换。预览队列元素为 `(PIL.Image, w, h)` 三元组。
 - 按帧头 `FRAME_BEGIN/SIZE/FRAME_END\n` 正则切帧，`PRE=160×120` 进预览队列，其余尺寸判为照片帧。
 - **自动重连**（应对裸机触碰短路复位）：
   1. 串口读异常 → 关闭并自动重开。
@@ -156,21 +184,48 @@ $cli = "d:\Projects\ov2640\tools\arduino-cli.exe"
 | 整幅花屏彩带 | 上位机没按 big-endian 解析 RGB565；排查坏数据位（GPIO1/2 方案） |
 | 画面糊 | 预览 QQVGA 被放大显示；切 QVGA 即可；定焦镜头近距离本身糊 |
 | 高分辨率切换卡死 | PSRAM 双缓冲 OOM → 已用 `fb_count_for()` 自适应 + 失败回退解决 |
-| JPEG 模式抓空帧 | **预编译 esp32-camera 库**对 SOI 校验过严，OV2640 不满足 → 改用 RGB565 稳定基线。真需 JPEG 须从源码重编译库（`lib/esp32-camera` 已存在但仍链接预编译 `.a`） |
+| JPEG 模式抓空帧 | **预编译 esp32-camera 库**在 JPEG 下返空帧（FB-OVF）→ 已用 **PlatformIO 源码编译**解决（见 4.2）。保持源码编译即可稳定出 JPEG |
 | 串口“拒绝访问” | 残留 python 进程占用 COM7，用任务管理器结束 `python.exe`（命令行匹配 `live_capture`） |
 | 偏绿缺蓝 | 检查是否只开 AWB+AGC（见 3.1）；必要时松开被注释的 awb_gain |
 | 裸机触碰死机 | 已在 live_capture 实现自动重连，数秒内自动恢复 |
 
 ---
 
-## 7. 遗留事项
+## 7. WiFi 传输（局域网 / 热点，高帧率）
 
-- **JPEG 模式**：当前强制 RGB565。要从源码编译 esp32-camera 替换预编译库（`board 链接的是 libespressif__esp32-camera.a`，需覆盖使其链接 `lib/esp32-camera` 源码产物），才能启用 JPEG 高压缩输出。
-- GPIO11/12 损坏是板级硬件缺陷，换板需恢复默认脚位映射并更新文档第2节。
+串口 2M 波特率约 200KB/s 是帧率瓶颈（QQVGA 预览约 5fps）。固件已内置 **WiFi 传输**：数据优先走 TCP，局域网模式实测 **QQVGA 约 10.8fps**（约串口的 2 倍）。
+
+### 模式一：STA 连入局域网（推荐，电脑不断网）
+
+固件默认以 STA 身份连接家庭路由器（`STA_SSID`/`STA_PASS`，见 `.ino` 顶部），DHCP 拿到局域网 IP；**电脑直接连板子局域网 IP 即可，无需切热点**。保留 AP 兜底热点 `OV2640Cam`。
+
+- **获取板子 IP**：上电后串口每 5 秒打印 `[WiFi] ip=x.x.x.x`。改写入 `.ino` 顶部的 `STA_SSID`/`STA_PASS` 即可换网。
+- **上位机连接**：`python live_capture.py --wifi <板子IP> 3333`，例如 `python live_capture.py --wifi 192.168.10.118 3333`。
+- 无头验证：`python verify_wifi.py <板子IP> 3333`（测预览帧率 + 一键 UXGA 拍照存 PNG）。
+- 帧/命令协议与串口完全一致，仅传输通道换成 TCP。
+
+### 模式二：AP 热点直连（兜底）
+
+当不在局域网内（现场无路由）时，手机/电脑连接板子热点 `OV2640Cam`（无密码），上位机连 `192.168.4.1:3333`：`python live_capture.py --wifi 192.168.4.1 3333`。
+
+### 注意事项
+
+- 若局域网内 ping 不通板子，大概率路由器开了 **AP 隔离**，需到路由器后台关闭（限制同网段设备互访）。
+- 板子 IP 由 DHCP 分配可能变化，以串口 `[WiFi] ip=` 打印为准；重烧/复位后重新读取。
+- 若 STA 连不上，固件自动退回纯热点模式，电脑连 `OV2640Cam` 走模式二。
 
 ---
 
-## 8. 开发历程：遇到的问题与解决（按时间顺序）
+## 8. 遗留事项
+
+- ~~JPEG 模式不可用~~ → **已解决**：PlatformIO 源码编译 esp32-camera（`esp32s3_camera_pio/`）正常出 JPEG，配合 UDP 预览帧率大幅提升。
+- GPIO11/12 损坏是板级硬件缺陷，换板需恢复默认脚位映射并更新文档第2节。
+- WiFi 上传带宽更高，拍大图(UXGA)帧率接近实时；拍照脚本若偶取到残留的预览帧（尺寸小于目标），属解析时序，需等待下一帧。
+- 高分辨率（UXGA）是 JPEG 单缓冲大帧，UDP 分片数可能逼近上限，必要时调大固件的分片许可（`nchunk>N` 处）。
+
+---
+
+## 9. 开发历程：遇到的问题与解决（按时间顺序）
 
 > 这一节是实际调试中逐个踩过、解决的坑，供将来复现/维护时对照。
 
