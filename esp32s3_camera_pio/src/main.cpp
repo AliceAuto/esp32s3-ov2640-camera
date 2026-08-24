@@ -32,8 +32,8 @@
 // ---- 函数原型（.ino 由 Arduino 自动生成，.cpp 需手动声明）----
 int fb_count_for(framesize_t fs);
 void send_frame(camera_fb_t *fb);
-void send_frame_udp(camera_fb_t *fb, IPAddress dst);
-void send_frame_wrapper(camera_fb_t *fb);
+bool send_frame_udp(camera_fb_t *fb, IPAddress dst);
+bool send_frame_wrapper(camera_fb_t *fb);
 framesize_t framesize_from_code(char code);
 void apply_color_calib();
 bool init_camera_as(framesize_t target, framesize_t fallback);
@@ -60,35 +60,45 @@ static uint32_t    g_last_ip_log = 0;
 #endif
 
 #ifdef ENABLE_WIFI
-static WiFiUDP     cam_udp;            // UDP 预览通道(高帧率, 丢帧不重传)
 static bool        udp_mode  = false;  // 上位机发 'U' 开启
 static uint16_t    udp_seq   = 0;
 
 // ---- 极致优化: UDP 直连 lwIP 原始 pcb 发送, 绕开 WiFiUdp 每包套接字开销 ----
 static struct udp_pcb *g_udp_pcb = NULL;
+static volatile uint32_t s_udp_err = 0;    // udp_sendto 失败次数(链路/队列瓶颈指示)
+static volatile uint32_t s_pbuf_fail = 0;  // pbuf_alloc 失败(DRAM 堆不足) -> 与 WiFi TX 队列满区分
+static volatile uint32_t s_retry_cnt = 0;  // 分片发送失败后经短重试成功恢复的次数
+static volatile int32_t  s_last_err = 0;   // 最近一次 udp_sendto 失败的错误码(诊断根因)
 static void udp_raw_init(uint16_t port) {
   g_udp_pcb = udp_new();
-  if (g_udp_pcb) udp_bind(g_udp_pcb, IP_ANY_TYPE, port);
+  if (g_udp_pcb) {
+    err_t e = udp_bind(g_udp_pcb, IP_ANY_TYPE, port);
+    Dbg.printf("[UDP] raw pcb bind :%u -> %s\n", port, (e == ERR_OK) ? "OK" : "FAIL");
+  }
 }
-static void udp_raw_send(const IPAddress &dst, uint16_t port,
-                         const uint8_t *hdr, size_t hdrLen,
-                         const uint8_t *data, size_t dataLen) {
-  if (!g_udp_pcb) return;
+static err_t udp_raw_send(const IPAddress &dst, uint16_t port,
+                          const uint8_t *hdr, size_t hdrLen,
+                          const uint8_t *data, size_t dataLen) {
+  if (!g_udp_pcb) return ERR_IF;
   size_t total = hdrLen + dataLen;
   struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, total, PBUF_RAM);
-  if (!p) return;
+  if (!p) { s_pbuf_fail++; s_udp_err++; return ERR_MEM; }
   memcpy(p->payload, hdr, hdrLen);
   if (dataLen) memcpy((uint8_t *)p->payload + hdrLen, data, dataLen);
   ip_addr_t ip;
   IP_ADDR4(&ip, dst[0], dst[1], dst[2], dst[3]);
-  udp_sendto(g_udp_pcb, p, &ip, port);
+  err_t e = udp_sendto(g_udp_pcb, p, &ip, port);
+  if (e != ERR_OK) { s_udp_err++; s_last_err = (int32_t)e; }  // 记录静默丢包(多为 WiFi TX 队列满/内存不足)
   pbuf_free(p);
+  return e;
 }
 
 // 板载诊断计数: 采集/发送/字节(volatile, 供 loop 周期打印定位瓶颈)
 static volatile uint32_t s_cap_cnt = 0;
 static volatile uint32_t s_sent_cnt = 0;
 static volatile uint32_t s_sent_bytes = 0;
+static volatile uint32_t s_noclient_cnt = 0;   // 无客户端被丢弃的帧数
+static volatile uint32_t s_congest_cnt = 0;    // 拥塞背压被丢弃的帧数
 #endif
 
 // ---- 引脚配置（esp32-camera 官方 ESP32-S3 示例，含损坏脚位移位）----
@@ -182,13 +192,18 @@ void send_frame(camera_fb_t *fb) {
 // 通过 UDP 把一整帧分片成多个数据报发送（预览用，丢帧不重传）。
 // 数据报布局: 12B头 + 分片。
 //   头: "OVU"(3) fmt(1) seq(2) cnt_minus1(1) idx(1) w(2) h(2)  fmt:0=RGB565 1=JPEG
-void send_frame_udp(camera_fb_t *fb, IPAddress dst) {
+// 返回 true=本帧完整发出; false=本帧被拥塞背压丢弃(未发出/半帧放弃)。
+// 极致优化: 发送失败(udp_sendto 非 OK = WiFi TX 队列满)时立即放弃本帧剩余分片,
+//   并对后续帧做背压(丢帧)让 TX 队列排空, 避免把报文灌进已满队列造成链路浪费。
+bool send_frame_udp(camera_fb_t *fb, IPAddress dst) {
   const size_t HDR   = 12;
   const size_t CHUNK = 1400 - HDR;     // 单报文净荷, 避开 MTU 分片
   const uint8_t *buf = fb->buf;
   size_t len = fb->len;
   size_t nchunk = (len + CHUNK - 1) / CHUNK;
   if (nchunk > 250) nchunk = 250;      // idx/cnt 是 u8
+  static uint8_t s_congest = 0;        // 拥塞背压: >0 时丢帧让 WiFi TX 队列排空
+  if (s_congest) { s_congest--; s_congest_cnt++; return false; }
   uint8_t hdr[HDR];
   hdr[0] = 'O'; hdr[1] = 'V'; hdr[2] = 'U';
   hdr[3] = (fb->format == PIXFORMAT_JPEG) ? 1 : 0;  // 格式: 0=RGB565 1=JPEG
@@ -205,10 +220,36 @@ void send_frame_udp(camera_fb_t *fb, IPAddress dst) {
     size_t n = len - off;
     if (n > CHUNK) n = CHUNK;
     hdr[7] = (uint8_t)i;
-    udp_raw_send(dst, TCP_PORT, hdr, HDR, buf + off, n);   // 极致优化: 原始 lwIP 快路径
+    // 极致优化(第二轮): udp_sendto 失败(ERR_MEM=-1 = WiFi netif TX 队列满)多为瞬时拥塞,
+    //   但实测 1ms 短重试几乎从不恢复(rty≈0)。按帧大小分策略:
+    //   - 小帧(≤4片, QQVGA/QVGA): "等队列排空"式轮询重试, 每 2ms 重试同分片, 最长等 12ms.
+    //     分片少, 阻塞代价低(QQVGA 帧周期 33ms), 实测丢包率降为 0.
+    //   - 大帧(>4片, VGA/SVGA): 只短重试(1ms), 不阻塞采集流水线; 持续失败即丢帧+背压,
+    //     避免每片 12ms 阻塞饿死发送(实测大帧长阻塞反而加剧丢包).
+    err_t e = udp_raw_send(dst, TCP_PORT, hdr, HDR, buf + off, n);
+    if (nchunk <= 4) {
+      uint32_t tq0 = millis();
+      while (e != ERR_OK && (uint32_t)(millis() - tq0) < 12) {
+        vTaskDelay(2);                       // 让 WiFi PHY 有时间把积压报文发出去, 队列排空
+        e = udp_raw_send(dst, TCP_PORT, hdr, HDR, buf + off, n);
+        if (e == ERR_OK) s_retry_cnt++;
+      }
+    } else {
+      for (int r = 0; e != ERR_OK && r < 2; r++) {
+        vTaskDelay(1);
+        e = udp_raw_send(dst, TCP_PORT, hdr, HDR, buf + off, n);
+        if (e == ERR_OK) s_retry_cnt++;
+      }
+    }
+    if (e != ERR_OK) {
+      s_congest = (nchunk <= 4) ? 2 : 3;     // 持续满: 背压丢帧让队列彻底排空
+      return false;                          // 放弃本帧剩余分片, 不再浪费发送
+    }
     off += n;
+    if (nchunk > 4) vTaskDelay(1);         // 多块帧(大图)突发易溢出 WiFi TX 队列 -> 1ms 节流
   }
   udp_seq++;
+  return true;
 }
 #endif
 
@@ -345,8 +386,7 @@ void setup_wifi() {
   WiFi.softAP(AP_SSID, AP_PASS);
   Dbg.printf("[WiFi] 兜底AP已开: %s\n", AP_SSID);
   cam_server.begin();
-  cam_udp.begin(TCP_PORT);
-  udp_raw_init(TCP_PORT);           // 极致优化: 原始 lwIP UDP 通道
+  udp_raw_init(TCP_PORT);           // 极致优化: 原始 lwIP UDP 通道(取代 cam_udp, 避免双绑定冲突)
   Dbg.printf("[WiFi] TCP监听: %u\n", TCP_PORT);
 
   Dbg.printf("[WiFi] STA 连接 %s ...\n", STA_SSID);
@@ -463,20 +503,23 @@ void handle_cmd(int c, Stream &in) {
 
 // 发送一帧预览：打开 UDP 时走 UDP(高帧率)，否则回退 TCP/串口(稳定)。
 // 无客户端时跳过发送(只保帧采集)，避免串口被帧淹没、干扰命令/日志通道。
-void send_frame_wrapper(camera_fb_t *fb) {
+// 返回 true=本帧已完整送出, false=被丢弃(无客户端/拥塞背压/TCP失败回退串口也算出)
+bool send_frame_wrapper(camera_fb_t *fb) {
 #ifdef ENABLE_WIFI
   if (cam_client && cam_client.connected()) {
+    bool ok;
     if (udp_mode)
-      send_frame_udp(fb, cam_client.remoteIP());
+      ok = send_frame_udp(fb, cam_client.remoteIP());
     else
-      send_frame(fb);
-    s_sent_cnt++;
-    s_sent_bytes += fb->len;
-    return;
+      { send_frame(fb); ok = true; }
+    if (ok) { s_sent_cnt++; s_sent_bytes += fb->len; }
+    return ok;
   }
-  return;   // 无客户端：丢弃帧，串口仅作命令/日志
+  s_noclient_cnt++;   // 无客户端: 丢弃帧, 串口仅作命令/日志
+  return false;
 #else
   send_frame(fb);
+  return true;
 #endif
 }
 
@@ -487,6 +530,21 @@ void loop() {
   if (cam_client && !cam_client.connected()) {
     cam_client.stop();
     cam_client = WiFiClient();
+  }
+  // 极致优化: 流媒体期间关掉兜底软AP, 释放单射频空口给 STA(AP/STA 时分共存会抢占 STA 发送,
+  //   导致 WiFi TX 队列持续满 -> VGA 大帧丢包). 无客户端时恢复 AP 兜底.
+  {
+    static bool s_ap_off = false;
+    bool has_client = (cam_client && cam_client.connected());
+    if (has_client && !s_ap_off) {
+      WiFi.softAPdisconnect();          // 仅关 AP 接口, 保留射频给 STA
+      s_ap_off = true;
+      Dbg.println("[WiFi] 流媒体: 软AP已关(释放空口给STA)");
+    } else if (!has_client && s_ap_off) {
+      WiFi.softAP(AP_SSID, AP_PASS);    // 恢复兜底 AP
+      s_ap_off = false;
+      Dbg.println("[WiFi] 无客户端: 软AP已恢复");
+    }
   }
   // 抢占式 accept: 即使旧客户端 connected() 仍为 true(半开/粘滞), 新连接也接管
   {
@@ -536,9 +594,16 @@ void loop() {
     uint32_t now = millis();
     if (now - s_last_diag >= 5000) {
       uint32_t cap = s_cap_cnt, sent = s_sent_cnt;
-      Dbg.printf("DIAG cap=%u (%.1f/s) sent=%u (%.1f/s) avg=%uB/fr",
+      Dbg.printf("DIAG cap=%u (%.1f/s) sent=%u (%.1f/s) avg=%uB/fr uerr=%u pbf=%u rty=%u skp=%u nc=%u err=%d rssi=%d",
                  cap, (cap - s_last_cap) / 5.0, sent, (sent - s_last_sent) / 5.0,
-                 sent ? (unsigned)(s_sent_bytes / sent) : 0u);
+                 sent ? (unsigned)(s_sent_bytes / sent) : 0u, (unsigned)s_udp_err,
+                 (unsigned)s_pbuf_fail, (unsigned)s_retry_cnt,
+                 (unsigned)s_congest_cnt, (unsigned)s_noclient_cnt, (int)s_last_err,
+#ifdef ENABLE_WIFI
+                 (int)WiFi.RSSI());
+#else
+                 0);
+#endif
       sensor_t *s = esp_camera_sensor_get();
       if (s) {   // AEC/AGC 实时值: 曝光/增益过大 => 场景暗导致帧率骤降
         uint32_t aec  = (uint32_t)s->get_reg(s, 0x0010, 0xFF);
