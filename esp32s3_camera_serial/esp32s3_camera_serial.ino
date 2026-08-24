@@ -58,6 +58,23 @@ static framesize_t cur_frame     = FRAMESIZE_QQVGA;
 // 摄像头配置全局保存，供失锁后 deinit+reinit 复用
 static camera_config_t g_config;
 
+// RGB565 每字节
+#define BYTES_PER_PIXEL 2
+// PSRAM 缓冲预算上限（留足余量，避免 8MB 被双缓冲或系统开销挤爆）
+#define MAX_FB_BYTES (6 * 1024 * 1024)   // 6MB
+
+// 依据分辨率自适应双缓冲数量：
+// 每帧太大时(AUXGA/UXGA)只分配单缓冲，否则双缓冲。防 PSRAM OOM 卡死。
+int fb_count_for(framesize_t fs) {
+  if (fs < 0 || fs >= FRAMESIZE_INVALID) return 1;
+  int w = resolution[fs].width;
+  int h = resolution[fs].height;
+  int64_t one = (int64_t)w * h * BYTES_PER_PIXEL;
+  int64_t two = one * 2;
+  if (two <= MAX_FB_BYTES) return 2;
+  return 1;
+}
+
 // 发送一帧原始数据(带尺寸头)
 void send_frame(camera_fb_t *fb) {
   Dbg.write(FRAME_BEGIN, sizeof(FRAME_BEGIN) - 1);
@@ -79,36 +96,57 @@ framesize_t framesize_from_code(char code) {
   }
 }
 
-// 失锁后重新初始化摄像头（先 deinit 释放 DMA/缓冲，再按全局配置重建）
+// 用全局配置以目标分辨率重建摄像头；返回是否成功
+// 失败时自动降级：高分辨率先强制单缓冲，再失败则回退到给定 fallback 分辨率
+bool init_camera_as(framesize_t target, framesize_t fallback) {
+  g_config.frame_size = target;
+  g_config.fb_count   = fb_count_for(target);
+  esp_err_t err = esp_camera_init(&g_config);
+  if (err == ESP_OK) {
+    cur_frame = target;
+    Dbg.printf("摄像头初始化: fs=%u fb=%d\n", (unsigned)target, g_config.fb_count);
+    return true;
+  }
+  Dbg.printf("init fs=%u 失败 err=0x%x, 尝试单缓冲...\n", (unsigned)target, err);
+  // 降级：单缓冲重试
+  g_config.fb_count = 1;
+  err = esp_camera_init(&g_config);
+  if (err == ESP_OK) {
+    cur_frame = target;
+    Dbg.printf("摄像头初始化(单缓冲): fs=%u fb=1\n", (unsigned)target);
+    return true;
+  }
+  // 再失败：回退到 fallback 分辨率，保证相机不处于死锁状态
+  Dbg.printf("单缓冲也失败 err=0x%x, 回退 fs=%u\n", err, (unsigned)fallback);
+  esp_camera_deinit();
+  delay(100);
+  g_config.frame_size = fallback;
+  g_config.fb_count   = fb_count_for(fallback);
+  err = esp_camera_init(&g_config);
+  if (err == ESP_OK) {
+    cur_frame = fallback;
+    Dbg.printf("已回退到 fs=%u\n", (unsigned)fallback);
+    return true;
+  }
+  Dbg.printf("回退也失败 err=0x%x\n", err);
+  return false;
+}
+
+// 失锁后重新初始化摄像头（先 deinit 释放 DMA/缓冲，再重建为当前分辨率）
 bool camera_reconnect() {
   Dbg.println("摄像头失锁, 正在重连...");
   esp_camera_deinit();
-  delay(200);
-  // 重连时重建为当前目标分辨率
-  g_config.frame_size = cur_frame;
-  esp_err_t err = esp_camera_init(&g_config);
-  if (err != ESP_OK) {
-    Dbg.printf("重连失败 err=0x%x\n", err);
-    return false;
-  }
-  Dbg.println("重连成功");
-  return true;
+  delay(300);
+  return init_camera_as(cur_frame, PREVIEW_FRAME);
 }
 
-// 真正的分辨率切换：deinit + init 全量重配 DMA 缓冲(预编译库 set_framesize 对 PSRAM 有缺陷)
+// 真正的分辨率切换：deinit + init 全量重配 DMA 缓冲，失败自动回退
 bool camera_change_framesize(framesize_t fs) {
-  if (cur_frame == fs && false) { /* 每次都重配，确保 DMA 缓冲随分辨率变化 */ }
+  if (fs == cur_frame) { return true; }  // 同分辨率无需切换
   esp_camera_deinit();
   delay(200);
-  g_config.frame_size = fs;
-  esp_err_t err = esp_camera_init(&g_config);
-  if (err != ESP_OK) {
-    Dbg.printf("切分辨率失败 err=0x%x\n", err);
-    return false;
-  }
-  cur_frame = fs;
-  Dbg.printf("分辨率已切换为: %u\n", (unsigned)fs);
-  return true;
+  // 目标失败则回退到当前已生效(或预览)分辨率，避免卡死在坏状态
+  return init_camera_as(fs, cur_frame);
 }
 
 void setup() {
@@ -139,7 +177,7 @@ void setup() {
   config.xclk_freq_hz = 20000000;           // 20MHz
   config.pixel_format = PIXFORMAT_RGB565;    // RGB565
   config.frame_size   = PREVIEW_FRAME;     // 初始：QQVGA 预览
-  config.fb_count     = 2;                 // 双缓冲(已验证可出帧)
+  config.fb_count     = fb_count_for(PREVIEW_FRAME);  // 自适应双缓冲(高分辨率降为1)
   config.fb_location  = CAMERA_FB_IN_PSRAM; // 8MB PSRAM 帧缓冲(UXGA 3.84MB)
 
   esp_err_t err = esp_camera_init(&config);
@@ -171,7 +209,7 @@ void loop() {
       // 拍照：切换到 HI_FRAME 抓一帧高清图发送，再切回预览
       Dbg.println("CMD_PHOTO");
       camera_change_framesize(HI_FRAME);
-      delay(300); // 等待全量重配稳定
+      delay(500); // 高分辨率全量重配稳定时间更长
       int attempt = 0;
       camera_fb_t *fb = NULL;
       while (!fb && attempt < 10) {   // 拍照时也带重试
