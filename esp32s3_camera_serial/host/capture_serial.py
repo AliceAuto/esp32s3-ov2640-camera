@@ -40,7 +40,7 @@ def main():
                     i_begin = buf.find(BEGIN)
                     if i_begin == -1:
                         # 丢弃累积的无效前缀，避免越搞越长（保留尾部可能不完整的 BEGIN）
-                        if len(buf) > 4 * BEGIN:
+                        if len(buf) > 4 * len(BEGIN):
                             keep = buf[-len(BEGIN):]
                             for k in range(1, len(BEGIN)):
                                 if BEGIN[:k] == buf[-k:]:
