@@ -21,6 +21,10 @@
 #include <WiFi.h>
 #include <WiFiServer.h>
 #include <WiFiUdp.h>
+#include "esp_wifi.h"
+#include "lwip/udp.h"
+#include "lwip/pbuf.h"
+#include "lwip/ip_addr.h"
 
 // ---- 像素格式：本工程专为解锁 JPEG ----
 #define PIX_FORMAT PIXFORMAT_JPEG   // JPEG（源库编译），改回 PIXFORMAT_RGB565 即旧基线
@@ -59,6 +63,32 @@ static uint32_t    g_last_ip_log = 0;
 static WiFiUDP     cam_udp;            // UDP 预览通道(高帧率, 丢帧不重传)
 static bool        udp_mode  = false;  // 上位机发 'U' 开启
 static uint16_t    udp_seq   = 0;
+
+// ---- 极致优化: UDP 直连 lwIP 原始 pcb 发送, 绕开 WiFiUdp 每包套接字开销 ----
+static struct udp_pcb *g_udp_pcb = NULL;
+static void udp_raw_init(uint16_t port) {
+  g_udp_pcb = udp_new();
+  if (g_udp_pcb) udp_bind(g_udp_pcb, IP_ANY_TYPE, port);
+}
+static void udp_raw_send(const IPAddress &dst, uint16_t port,
+                         const uint8_t *hdr, size_t hdrLen,
+                         const uint8_t *data, size_t dataLen) {
+  if (!g_udp_pcb) return;
+  size_t total = hdrLen + dataLen;
+  struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, total, PBUF_RAM);
+  if (!p) return;
+  memcpy(p->payload, hdr, hdrLen);
+  if (dataLen) memcpy((uint8_t *)p->payload + hdrLen, data, dataLen);
+  ip_addr_t ip;
+  IP_ADDR4(&ip, dst[0], dst[1], dst[2], dst[3]);
+  udp_sendto(g_udp_pcb, p, &ip, port);
+  pbuf_free(p);
+}
+
+// 板载诊断计数: 采集/发送/字节(volatile, 供 loop 周期打印定位瓶颈)
+static volatile uint32_t s_cap_cnt = 0;
+static volatile uint32_t s_sent_cnt = 0;
+static volatile uint32_t s_sent_bytes = 0;
 #endif
 
 // ---- 引脚配置（esp32-camera 官方 ESP32-S3 示例，含损坏脚位移位）----
@@ -102,12 +132,14 @@ static camera_config_t g_config;
 #define BYTES_PER_PIXEL 2
 #define MAX_FB_BYTES (6 * 1024 * 1024)   // 6MB
 
-// 依据分辨率自适应双缓冲数量（大图降为1，防 PSRAM OOM 卡死）
+// 依据分辨率自适应缓冲数量: 小图3缓冲(发送慢时采集不停顿), 中图2, 大图1(防 PSRAM OOM 卡死)
 int fb_count_for(framesize_t fs) {
   if (fs < 0 || fs >= FRAMESIZE_INVALID) return 1;
   int w = resolution[fs].width;
   int h = resolution[fs].height;
   int64_t one = (int64_t)w * h * BYTES_PER_PIXEL;
+  int64_t three = one * 3;
+  if (three <= MAX_FB_BYTES) return 3;
   int64_t two = one * 2;
   if (two <= MAX_FB_BYTES) return 2;
   return 1;
@@ -173,10 +205,7 @@ void send_frame_udp(camera_fb_t *fb, IPAddress dst) {
     size_t n = len - off;
     if (n > CHUNK) n = CHUNK;
     hdr[7] = (uint8_t)i;
-    cam_udp.beginPacket(dst, TCP_PORT);
-    cam_udp.write(hdr, HDR);
-    cam_udp.write(buf + off, n);
-    cam_udp.endPacket();
+    udp_raw_send(dst, TCP_PORT, hdr, HDR, buf + off, n);   // 极致优化: 原始 lwIP 快路径
     off += n;
   }
   udp_seq++;
@@ -311,11 +340,13 @@ void setup() {
 #ifdef ENABLE_WIFI
 void setup_wifi() {
   WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);             // 极致优化: 关 modem sleep, 降每包唤醒延迟/抖动
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_SSID, AP_PASS);
   Dbg.printf("[WiFi] 兜底AP已开: %s\n", AP_SSID);
   cam_server.begin();
   cam_udp.begin(TCP_PORT);
+  udp_raw_init(TCP_PORT);           // 极致优化: 原始 lwIP UDP 通道
   Dbg.printf("[WiFi] TCP监听: %u\n", TCP_PORT);
 
   Dbg.printf("[WiFi] STA 连接 %s ...\n", STA_SSID);
@@ -329,6 +360,10 @@ void setup_wifi() {
     IPAddress ip = WiFi.localIP();
     Dbg.printf("\n[WiFi] STA已连: %s ip=%d.%d.%d.%d\n",
                STA_SSID, ip[0], ip[1], ip[2], ip[3]);
+    // 极致优化: AP/STA 共用单射频, 统一到 STA 信道避免时隙切换丢包
+    uint8_t ch = WiFi.channel();
+    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    Dbg.printf("[WiFi] 统一信道 ch=%u\n", ch);
   } else {
     Dbg.printf("\n[WiFi] STA 连接超时, 仅 AP 可用 ip=192.168.4.1\n");
   }
@@ -435,6 +470,8 @@ void send_frame_wrapper(camera_fb_t *fb) {
       send_frame_udp(fb, cam_client.remoteIP());
     else
       send_frame(fb);
+    s_sent_cnt++;
+    s_sent_bytes += fb->len;
     return;
   }
   return;   // 无客户端：丢弃帧，串口仅作命令/日志
@@ -459,6 +496,7 @@ void loop() {
       cam_client = s;
       cam_client.setNoDelay(true);
       cam_client.setTimeout(500);
+      udp_mode = false;   // 新客户端默认走 TCP(可靠), 需显式 'U' 才切 UDP, 避免模式跨连接粘滞
       Dbg.println("WiFi 客户端接入(抢占)");
     }
   }
@@ -488,7 +526,29 @@ void loop() {
     }
     return;
   }
+  s_cap_cnt++;
   send_frame_wrapper(fb);
   esp_camera_fb_return(fb);
-  delay(1);
+
+  // ---- 极致优化诊断: 每 5s 打印采集/发送速率/帧长/曝光增益, 定位瓶颈端 ----
+  {
+    static uint32_t s_last_diag = 0, s_last_cap = 0, s_last_sent = 0;
+    uint32_t now = millis();
+    if (now - s_last_diag >= 5000) {
+      uint32_t cap = s_cap_cnt, sent = s_sent_cnt;
+      Dbg.printf("DIAG cap=%u (%.1f/s) sent=%u (%.1f/s) avg=%uB/fr",
+                 cap, (cap - s_last_cap) / 5.0, sent, (sent - s_last_sent) / 5.0,
+                 sent ? (unsigned)(s_sent_bytes / sent) : 0u);
+      sensor_t *s = esp_camera_sensor_get();
+      if (s) {   // AEC/AGC 实时值: 曝光/增益过大 => 场景暗导致帧率骤降
+        uint32_t aec  = (uint32_t)s->get_reg(s, 0x0010, 0xFF);
+        uint32_t aech = (uint32_t)s->get_reg(s, 0x0045, 0x3F);
+        uint32_t gain = (uint32_t)s->get_reg(s, 0x0000, 0xFF);
+        Dbg.printf(" aec_lo=0x%02X aec_hi=0x%02X gain=0x%02X\n", aec, aech, gain);
+      } else {
+        Dbg.printf("\n");
+      }
+      s_last_diag = now; s_last_cap = cap; s_last_sent = sent;
+    }
+  }
 }
