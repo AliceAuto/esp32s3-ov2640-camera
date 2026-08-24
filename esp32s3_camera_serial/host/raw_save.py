@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """抓取一帧原始 RGB565 字节到文件。
-用法: python raw_save.py COM7 921600 out.bin
+用法: python raw_save.py COM7 2000000 out.bin [W] [H]
 """
 import sys, serial, time
 
 port = sys.argv[1] if len(sys.argv) > 1 else "COM7"
-baud = int(sys.argv[2]) if len(sys.argv) > 2 else 921600
+baud = int(sys.argv[2]) if len(sys.argv) > 2 else 2000000
 out = sys.argv[3] if len(sys.argv) > 3 else "raw.bin"
+W = int(sys.argv[4]) if len(sys.argv) > 4 else 160
+H = int(sys.argv[5]) if len(sys.argv) > 5 else 120
 BEGIN = b"FRAME_BEGIN\n"
 END = b"FRAME_END\n"
-W, H = 160, 120
+
 FRAME_BYTES = W * H * 2
 
 ser = serial.Serial(port, baud, timeout=1)
