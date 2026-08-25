@@ -13,6 +13,7 @@ import sys, time, threading, queue, io
 import socket
 from PIL import Image, ImageTk
 import tkinter as tk
+from tkinter import ttk
 
 _args = [x for x in sys.argv[1:] if x != "--wifi"]
 host = _args[0] if _args else "192.168.4.1"
@@ -30,6 +31,8 @@ q = queue.Queue()
 frame_count = [0]
 stop = threading.Event()
 start_t = [time.time()]
+tcp_chan = [None]                # TCP 命令通道(供 GUI 线程切分辨率/质量)
+RES_MAP = {"QQVGA": "q", "QVGA": "t", "VGA": "v", "SVGA": "s", "XGA": "x", "UXGA": "u"}
 
 # 长时间没有任何完整帧就触发一次自恢复(板子重启/失锁会停发, 需重发 'U' 开启 UDP 模式)
 RECONNECT_AFTER = 4.0
@@ -119,6 +122,7 @@ def reader():
         stop.set()
         udp.close()
         return
+    tcp_chan[0] = tcp                     # GUI 切分辨率命令走这条通道
     print("已发 'U' 开启 UDP 预览, TCP 通道就绪", flush=True)
     last_good = time.time()
     while not stop.is_set():
@@ -129,9 +133,11 @@ def reader():
                 tcp.close()
             except Exception:
                 pass
+            tcp_chan[0] = None
             tcp = open_tcp_cmd()
             if tcp is None:
                 break
+            tcp_chan[0] = tcp
             print("恢复重连成功, 等待帧回来", flush=True)
             last_good = time.time()
             ctx.clear(); ctx.update(seq=None, cnt=0, w=0, h=0, fmt=0, parts=None, got=0)
@@ -152,6 +158,7 @@ def reader():
             print(f"fps={fps:6.1f}  {fps_state['w']}x{fps_state['h']} {name}  累计帧 {frame_count[0]}", flush=True)
             fps_state["t"], fps_state["n"] = now, frame_count[0]
     udp.close()
+    tcp_chan[0] = None
     try:
         tcp.close()
     except Exception:
@@ -188,6 +195,28 @@ label = tk.Label(root, bg="black")
 label.pack()
 fps_lbl = tk.Label(root, text="连接中...", anchor="w", padx=6)
 fps_lbl.pack(fill="x")
+
+# 控制栏: 分辨率下拉框(点击即切, 自动重开 UDP)
+ctrl = ttk.Frame(root)
+ctrl.pack(fill="x", padx=6, pady=4)
+ttk.Label(ctrl, text="分辨率:").pack(side="left")
+res_cb = ttk.Combobox(ctrl, values=list(RES_MAP.keys()), state="readonly", width=8)
+res_cb.set("QVGA")
+res_cb.pack(side="left", padx=(4, 12))
+ttk.Label(ctrl, text="(切换后自动重开 UDP)", foreground="#888").pack(side="left")
+
+def on_res(_ev=None):
+    code = RES_MAP.get(res_cb.get())
+    if not code or tcp_chan[0] is None:
+        return
+    try:
+        # 'v<分辨率码>' 切分辨率; 再补 'U' 确保仍在 UDP 预览模式
+        tcp_chan[0].sendall(("v" + code + "\nU").encode())
+        print(f"切换分辨率 -> {res_cb.get()}({code}), 已重开 UDP", flush=True)
+    except Exception as e:
+        print("切换失败:", e, flush=True)
+res_cb.bind("<<ComboboxSelected>>", on_res)
+
 root.bind("<Control-q>", lambda e: (stop.set(), root.destroy()))
 th = threading.Thread(target=reader, daemon=True)
 th.start()

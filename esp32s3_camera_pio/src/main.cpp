@@ -53,6 +53,7 @@ HardwareSerial Dbg(0);
 #define STA_PASS   "swc670143"
 #define AP_SSID    "OV2640Cam"         // 兜底热点
 #define AP_PASS    ""
+#define AP_CHANNEL 6                   // 空闲信道(实测 ch1 拥挤, ch2-14 空; 走热点直连可用)
 #define TCP_PORT   3333
 static WiFiServer  cam_server(TCP_PORT);
 static WiFiClient  cam_client;
@@ -383,8 +384,8 @@ void setup_wifi() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);             // 极致优化: 关 modem sleep, 降每包唤醒延迟/抖动
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-  WiFi.softAP(AP_SSID, AP_PASS);
-  Dbg.printf("[WiFi] 兜底AP已开: %s\n", AP_SSID);
+  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL);   // 热点跑空闲信道(免 STA 拥挤信道)
+  Dbg.printf("[WiFi] 兜底AP已开: %s (ch%u)\n", AP_SSID, AP_CHANNEL);
   cam_server.begin();
   udp_raw_init(TCP_PORT);           // 极致优化: 原始 lwIP UDP 通道(取代 cam_udp, 避免双绑定冲突)
   Dbg.printf("[WiFi] TCP监听: %u\n", TCP_PORT);
@@ -491,6 +492,50 @@ void handle_cmd(int c, Stream &in) {
   } else if (c == 'r' || c == 'R') {
     camera_reconnect();
 #ifdef ENABLE_WIFI
+  } else if (c == 'c') {
+    // 信道扫描诊断: 统计 2.4GHz 1-13 信道上的 AP 数/最强/平均RSSI, 用于挑选空闲信道.
+    // 异步扫描+轮询(阻塞扫描在 AP_STA 双模下常返空), 最多等 5s.
+    esp_wifi_scan_stop();
+    wifi_scan_config_t sc = {0};
+    sc.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    sc.show_hidden = true;
+    if (esp_wifi_scan_start(&sc, false) != ESP_OK) { Dbg.println("c: scan start FAIL"); }
+    uint16_t n = 0;
+    uint32_t t0 = millis();
+    do {
+      vTaskDelay(200);
+      esp_wifi_scan_get_ap_num(&n);
+    } while (n == 0 && (millis() - t0) < 5000);
+    if (n > 0) {
+      wifi_ap_record_t *rec = (wifi_ap_record_t*)calloc(n, sizeof(wifi_ap_record_t));
+      if (rec) {
+        esp_wifi_scan_get_ap_records(&n, rec);
+        struct ChStat { int cnt; int sum; int min; } ch[16] = {0};
+        for (uint16_t i = 0; i < n; i++) {
+          int cn = rec[i].primary;
+          if (cn < 1 || cn > 14) continue;
+          ch[cn].cnt++;
+          ch[cn].sum += rec[i].rssi;
+          if (!ch[cn].min || rec[i].rssi > ch[cn].min) ch[cn].min = rec[i].rssi;
+        }
+        Dbg.printf("c: 扫描到 %u 个AP, 各信道[AP数 最强RSSI 平均RSSI]:\n", n);
+        int best = 1, bestScore = 0x7fffffff;
+        for (int i = 1; i <= 14; i++) {
+          if (ch[i].cnt == 0) { Dbg.printf("  ch%02d: 空\n", i); if (i <= best) best = i; continue; }
+          int avg = ch[i].sum / ch[i].cnt;
+          Dbg.printf("  ch%02d: %2d个 最强%3ddBm 平均%3ddBm%s\n",
+                     i, ch[i].cnt, ch[i].min, avg,
+                     (i == WiFi.channel()) ? " <-当前STA" : "");
+          int score = ch[i].cnt * 10 + (avg > -70 ? avg + 70 : 0);
+          if (score < bestScore) { bestScore = score; best = i; }
+        }
+        Dbg.printf("c: 最空信道 = ch%02d\n", best);
+        free(rec);
+      }
+    } else {
+      Dbg.println("c: 5s 内未扫到任何AP");
+    }
+    esp_wifi_scan_stop();
   } else if (c == 'U') {
     udp_mode = true;
     Dbg.println("UDP 预览模式开启");
@@ -533,15 +578,17 @@ void loop() {
   }
   // 极致优化: 流媒体期间关掉兜底软AP, 释放单射频空口给 STA(AP/STA 时分共存会抢占 STA 发送,
   //   导致 WiFi TX 队列持续满 -> VGA 大帧丢包). 无客户端时恢复 AP 兜底.
+  //   ⚠️ 仅在 LAN(STA已连) 下关 AP: 若客户端走热点直连(免拥挤信道), 关掉 AP 即断流, 须保 AP 存活.
   {
     static bool s_ap_off = false;
     bool has_client = (cam_client && cam_client.connected());
-    if (has_client && !s_ap_off) {
+    bool has_lan    = (WiFi.status() == WL_CONNECTED);
+    if (has_client && has_lan && !s_ap_off) {
       WiFi.softAPdisconnect();          // 仅关 AP 接口, 保留射频给 STA
       s_ap_off = true;
       Dbg.println("[WiFi] 流媒体: 软AP已关(释放空口给STA)");
     } else if (!has_client && s_ap_off) {
-      WiFi.softAP(AP_SSID, AP_PASS);    // 恢复兜底 AP
+      WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL);   // 恢复兜底 AP 到空闲信道
       s_ap_off = false;
       Dbg.println("[WiFi] 无客户端: 软AP已恢复");
     }
