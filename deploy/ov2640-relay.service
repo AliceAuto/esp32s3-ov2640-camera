@@ -1,0 +1,13 @@
+[Unit]
+Description=OV2640 Cross-Network Relay Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/ov2640-relay
+ExecStart=/usr/bin/python3 /opt/ov2640-relay/relay_server.py 8001
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

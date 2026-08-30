@@ -107,6 +107,7 @@ static uint64_t    g_adapt_total_bytes  = 0;
 
 // ---- 局域网自动发现 + 跨网中继客户端 ----
 #define DISCOVERY_PORT  9999          // 局域网广播发现端口
+#define RELAY_HOST_DEFAULT "8.148.79.85:8001"   // 未配置时默认连接的公网中继服务端(空=关闭)
 static WiFiUDP      disc_udp;
 static uint32_t     g_disc_last_ms = 0;
 
@@ -767,7 +768,7 @@ void setup_wifi() {
   String _pass = g_prefs.getString("pass", String(STA_PASS));
   String _name = g_prefs.getString("name", String(AP_SSID));
   String _id   = g_prefs.getString("id",   default_dev_id());
-  String _relay= g_prefs.getString("relay", "");      // "host:port", 空=关闭中继
+  String _relay= g_prefs.getString("relay", RELAY_HOST_DEFAULT);   // "host:port", 空=关闭中继
   g_prefs.end();
   _ssid.toCharArray(g_sta_ssid, sizeof(g_sta_ssid));
   _pass.toCharArray(g_sta_pass, sizeof(g_sta_pass));

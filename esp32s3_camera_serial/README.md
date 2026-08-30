@@ -156,7 +156,7 @@ $pio = "C:\Users\27427\AppData\Local\Programs\Python\Python311\Scripts\pio.exe"
 | 脚本 | 用途 |
 | ---- | ---- |
 | **`live_capture.py`** | **主程序**：实时预览 GUI + 下拉切换预览/拍照分辨率 + 一键拍照存图 + **自动重连**。用法：`python live_capture.py COM7 [baud]`、`--auto`（局域网自动发现）、`--wifi <IP> 3333`、`--relay 服务器:端口 [--id 设备ID]`（跨网观看） |
-| **`relay_server.py`** | **跨网信令+中继服务端**（项目根目录）：摄像头注册/终端查列表/watch/双向字节中继。用法：`python relay_server.py 8000`，需云服务器放行 TCP 端口 |
+| **`relay_server.py`** | **跨网信令+中继服务端**（项目根目录）：摄像头注册/终端查列表/watch/双向字节中继。用法：`python relay_server.py 8001`，需云服务器放行 TCP 端口 |
 | **`udp_capture.py`** | **JPEG 高帧率预览**：走 UDP 通道（丢帧不重传）+ JPEG 解码，帧率明显高于 TCP。用法：`python udp_capture.py --wifi <IP> 3333` |
 | `verify_switch.py` | 自动验证：预览切 QVGA、拍照切 UXGA、切回 QQVGA 的无头验证脚本 |
 | `hi_res_capture.py` | UXGA 无头抓拍教程脚本 |
@@ -240,11 +240,11 @@ python live_capture.py --auto
 当终端与摄像头**不在同一局域网**时，二者经公网 **中继服务端**（`relay_server.py`）完成注册与双向字节中继：
 
 ```powershell
-# 云服务器上(放行 TCP 8000)
-python relay_server.py 8000
+# 云服务器上(放行 TCP 8001)
+python relay_server.py 8001
 
 # 终端远程观看(不指定 --id 则自动选第一台在线)
-python live_capture.py --relay 1.2.3.4:8000 --id cam-87A1B2
+python live_capture.py --relay 8.148.79.85:8001 --id cam-87A1B2
 ```
 
 - **固件侧**：配网页填「中继服务端 IP:端口」后，摄像头常驻连接该服务端并注册为在线设备（`id` 可自定义，默认 `cam-<MAC尾>`）；有观众 `watch` 时开始把 `FRAME_BEGIN...FRAME_END` 帧作为中继消息上行，并把观众下行命令透传回命令处理器。断线自动重连。

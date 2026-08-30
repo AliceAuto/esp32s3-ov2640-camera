@@ -42,7 +42,7 @@ if MODE == "wifi":
     port = _pos[0] if _pos else "192.168.4.1"
     baud = int(_pos[1]) if len(_pos) > 1 else 3333
 elif MODE == "relay":
-    port = _pos[0] if _pos else "127.0.0.1:8000"   # "host:port"
+    port = _pos[0] if _pos else "8.148.79.85:8001"   # "host:port" 中继服务端
     baud = 0
 elif MODE == "auto":
     port = None
