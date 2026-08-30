@@ -1,64 +1,117 @@
 # -*- coding: utf-8 -*-
 """
-OV2640 UDP 预览帧率测试（对比 TCP 性能）。
+OV2640 UDP 高帧率预览上位机 v2。
 
-- 用 TCP 连接板子发送命令(开启 UDP 预览 'U')，同时保留拍照/命令通道。
-- 预览帧改走 UDP(高帧率, 丢帧不重传) 接收并显示，实时统计帧率。
-- 拍照仍走 TCP(可靠) —— 暂未在本脚本实现，仅测预览帧率。
+- UDP 收预览帧(丢帧不重传)，TCP 发命令/收拍照帧。
+- 预览队列只保留最新一帧：解码跟不上时丢旧不滞后。
+- 底部状态栏: 连接徽章 + 模式/分辨率/帧率/带宽；顶部工具栏: 传输模式、
+  预览分辨率、JPEG画质滑杆、照片分辨率+拍照(防连点)、当前画面存图。
 
-用法: python udp_capture.py --wifi [host] [port]   (host 默认 192.168.4.1, port 默认 3333)
-快捷键: Ctrl+Q 退出
+用法: python udp_capture.py --wifi [host] [port] [res_code]
+      python udp_capture.py --selftest          # 无 GUI 协议自检
+快捷键: Ctrl+Q 退出, Ctrl+S 当前画面存图
 """
-import sys, time, threading, queue, io
+import sys, os, io, re, time, threading, queue
 import socket
-from PIL import Image, ImageTk
-import tkinter as tk
-from tkinter import ttk
+from collections import deque
 
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+# ---- 参数解析 (兼容旧用法: --wifi [host] [port] [res]) ----
 _args = [x for x in sys.argv[1:] if x != "--wifi"]
+SELFTEST = "--selftest" in sys.argv
 host = _args[0] if _args else "192.168.4.1"
 port = int(_args[1]) if len(_args) > 1 else 3333
-# 第3个参数为分辨率 code(q/t/v/s/x/u), 拼成两字节命令 'v<code>' 再 'U' 开 UDP; 空则仅开 UDP
-res_code = _args[2] if len(_args) > 2 else ""
-res_cmd = (("v" + res_code) if res_code else "") + "U"
+res_code = (_args[2].strip() if len(_args) > 2 else "")
 
-# UDP 帧头布局(与固件 send_frame_udp 一致)
+# ---- 协议常量(与固件 send_frame_udp 一致) ----
 HDR = 12
 MAGIC = b"OVU"
 CHUNK = 1400 - HDR
 
-q = queue.Queue()
-frame_count = [0]
-stop = threading.Event()
-start_t = [time.time()]
-tcp_chan = [None]                # TCP 命令通道(供 GUI 线程切分辨率/质量)
-RES_MAP = {"QQVGA": "q", "QVGA": "t", "VGA": "v", "SVGA": "s", "XGA": "x", "UXGA": "u"}
+RES_INFO = {
+    "QQVGA": ("q", 160, 120),
+    "QVGA":  ("t", 320, 240),
+    "VGA":   ("v", 640, 480),
+    "SVGA":  ("s", 800, 600),
+    "XGA":   ("x", 1024, 768),
+    "UXGA":  ("u", 1600, 1200),
+}
+def res_label(name):
+    code, w, h = RES_INFO[name]
+    return f"{name} {w}x{h}"
+RES_LABELS = [res_label(n) for n in RES_INFO]
+def code_of(label):
+    return RES_INFO[label.split()[0]][0]
 
-# 长时间没有任何完整帧就触发一次自恢复(板子重启/失锁会停发, 需重发 'U' 开启 UDP 模式)
-RECONNECT_AFTER = 4.0
+PHOTO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photos")
+RECONNECT_AFTER = 4.0        # 预览停流超此秒数 -> TCP 重连并重下发命令
+STAT_WINDOW = 5.0            # 帧率统计窗口(秒)
 
-# UDP 帧重组状态
-ctx = {"seq": None, "cnt": 0, "w": 0, "h": 0, "fmt": 0, "parts": None, "got": 0}
-# 终端 fps 统计
-fps_state = {"t": time.time(), "n": 0, "w": 0, "h": 0, "fmt": 0}
+# ---- 共享状态(主线程读、reader 线程写, 均为单赋值原子操作) ----
+G = {
+    "mode": "UDP",
+    "tcp": None,
+    "stop": threading.Event(),
+    "last_good": 0.0,        # 最近一次完整预览帧到达时刻
+    "photo_until": 0.0,      # 拍照互斥截止时刻
+    "frames": 0,             # 完整帧总数(samples 是定长滚动窗, 不能当累计用)
+    "drops": 0,              # 按帧序号缺口估算的链路丢帧数
+    "photo_pending": False,  # 已发 P 待收照片: 下一个完整 TCP 帧单元路由给照片而非预览
+}
+samples = deque(maxlen=1024)         # (t, bytes) 完整帧滚动记录
+seq_state = {"last": None}           # 最近一次完整帧的 seq(用于丢帧估算)
+tcp_rx = bytearray()                 # TCP 唯一接收缓冲: 单点读取再分发给照片/预览解析
+stat_t = [time.time()]
+prev_q = queue.Queue(maxsize=2)      # 只保留最新一帧的预览队列
+photo_q = queue.Queue()
+udp_ctx = {"seq": None, "cnt": 0, "w": 0, "h": 0, "fmt": 0,
+           "parts": None, "got": 0}
+_TCP_FRAME = re.compile(rb'FRAME_BEGIN\nSIZE (\d+) (\d+) (\w+)\n(.*?)FRAME_END\n', re.S)
+
+
+def _put_latest(item):
+    """入预览队列；满则丢最旧，保证渲染端永远拿较新一帧。"""
+    try:
+        prev_q.put_nowait(item)
+    except queue.Full:
+        try:
+            prev_q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            prev_q.put_nowait(item)
+        except queue.Full:
+            pass
 
 
 def convert_rgb(frame, w, h):
-    rgb = bytearray(w * h * 3)
+    """big-endian RGB565 -> RGB888。numpy 向量化优先，无则纯 Python。"""
+    if np is not None:
+        a = np.frombuffer(frame[:w * h * 2], dtype=np.uint16).byteswap()
+        flat = np.empty((w * h, 3), dtype=np.uint8)
+        flat[:, 0] = (((a >> 11) & 0x1F).astype(np.uint16) * 255 + 15) // 31
+        flat[:, 1] = (((a >> 5) & 0x3F).astype(np.uint16) * 255 + 31) // 63
+        flat[:, 2] = ((a & 0x1F).astype(np.uint16) * 255 + 15) // 31
+        return flat.reshape(h, w, 3).tobytes()
+    out = bytearray(w * h * 3)
     j = 0
     for o in range(0, len(frame), 2):
-        v = (frame[o] << 8) | frame[o + 1]      # big-endian RGB565
+        v = (frame[o] << 8) | frame[o + 1]
         r = (v >> 11) & 0x1F; g = (v >> 5) & 0x3F; b = v & 0x1F
-        rgb[j] = (r * 255 + 15) // 31
-        rgb[j + 1] = (g * 255 + 31) // 63
-        rgb[j + 2] = (b * 255 + 15) // 31
+        out[j] = (r * 255 + 15) // 31
+        out[j + 1] = (g * 255 + 31) // 63
+        out[j + 2] = (b * 255 + 15) // 31
         j += 3
-    return bytes(rgb)
+    return bytes(out)
 
 
 def udp_feed(pkt):
-    """吃一个数据报, 重组整帧; 整帧到齐返回 True。"""
-    global ctx
+    """吃一个数据报重组整帧；到齐且校验通过返回 True 并入预览队列。"""
+    global udp_ctx
     if len(pkt) < HDR or pkt[:3] != MAGIC:
         return False
     seq = (pkt[4] << 8) | pkt[5]
@@ -66,161 +119,631 @@ def udp_feed(pkt):
     idx = pkt[7]
     w = (pkt[8] << 8) | pkt[9]
     h = (pkt[10] << 8) | pkt[11]
-    fmt = pkt[3]                                # 0=RGB565 1=JPEG
-    payload = pkt[HDR:]
-    if ctx["seq"] != seq:                        # 新帧
-        ctx = {"seq": seq, "cnt": cnt, "w": w, "h": h, "fmt": fmt,
-               "parts": [None] * cnt, "got": 0}
-    if idx >= ctx["cnt"]:
+    fmt = pkt[3]
+    if udp_ctx["seq"] != seq:
+        udp_ctx.update(seq=seq, cnt=cnt, w=w, h=h, fmt=fmt,
+                       parts=[None] * cnt, got=0)
+    if idx >= udp_ctx["cnt"]:
         return False
-    if ctx["parts"][idx] is None:
-        ctx["parts"][idx] = payload
-        ctx["got"] += 1
-    if ctx["got"] == ctx["cnt"]:                 # 整帧到齐
-        frame = b"".join(ctx["parts"])
-        fw, fh, ffmt = ctx["w"], ctx["h"], ctx["fmt"]
-        ctx = {"seq": None, "cnt": 0, "w": 0, "h": 0, "fmt": 0,
+    if udp_ctx["parts"][idx] is None:
+        udp_ctx["parts"][idx] = pkt[HDR:]
+        udp_ctx["got"] += 1
+    if udp_ctx["got"] != udp_ctx["cnt"]:
+        return False
+    frame = b"".join(udp_ctx["parts"])
+    fw, fh, ffmt = udp_ctx["w"], udp_ctx["h"], udp_ctx["fmt"]
+    udp_ctx = {"seq": None, "cnt": 0, "w": 0, "h": 0, "fmt": 0,
                "parts": None, "got": 0}
-        # JPEG: 长度不定, 校验头部 FF D8 与尾 FF D9; RGB565: 长度需等于 w*h*2
-        ok = False
-        if ffmt == 1:
-            ok = len(frame) > 100 and frame[:2] == b"\xff\xd8" and frame[-2:] == b"\xff\xd9"
-        else:
-            ok = len(frame) == fw * fh * 2 and fw > 0 and fh > 0
-        if ok:
-            q.put((ffmt, frame, fw, fh))
-            frame_count[0] += 1
-            fps_state["w"], fps_state["h"], fps_state["fmt"] = fw, fh, ffmt
+    if ffmt == 1:
+        ok = len(frame) > 100 and frame[:2] == b"\xff\xd8" and frame[-2:] == b"\xff\xd9"
+    else:
+        ok = fw > 0 and fh > 0 and len(frame) == fw * fh * 2
+    if not ok:
+        return False
+    samples.append((time.time(), len(frame)))
+    G["last_good"] = time.time()
+    G["frames"] += 1
+    prev = seq_state["last"]
+    if prev is not None:
+        gap = (seq - prev - 1) & 0xFFFF     # 整帧丢失数量(含固件背压丢帧与网络丢片)
+        if 0 < gap < 4096:
+            G["drops"] += gap
+    seq_state["last"] = seq
+    _put_latest((ffmt, frame, fw, fh))
+    return True
+
+
+def _route_jpeg_frame(body, w, h):
+    """按 pending 状态把一个完整 JPG 帧单元分发给照片(可靠消费, 不丢)或预览通道。"""
+    samples.append((time.time(), len(body)))
+    if G["photo_pending"]:
+        G["photo_pending"] = False
+        photo_q.put((bytes(body), w, h))
+        return
+    G["last_good"] = time.time()
+    G["frames"] += 1
+    _put_latest((1, bytes(body), w, h))
+
+
+def _pump_bytes(data):
+    """向唯一 TCP 缓冲喂字节并循环解出所有完整帧单元。
+
+    此前照片与预览各自独立 recv 同一 socket, 一包数据被劈成两半拼出损坏 JPEG;
+    统一缓冲后按帧单元完整解析再分发, 从根上消除拼接损坏。"""
+    tcp_rx.extend(data)
+    while True:
+        i = tcp_rx.find(b"FRAME_BEGIN\n")
+        if i < 0:
+            del tcp_rx[:-12]
+            return
+        nl = tcp_rx.find(b"\n", i + 12)
+        if nl < 0:
+            if i > 0:
+                del tcp_rx[:i]
+            return
+        m = re.match(rb"SIZE\s+(\d+)\s+(\d+)\s+(\w+)", bytes(tcp_rx[i + 12:nl]))
+        e = tcp_rx.find(b"FRAME_END\n", nl + 1)
+        if e < 0:
+            if i > 0:
+                del tcp_rx[:i]
+            return
+        body = bytes(tcp_rx[nl + 1:e])
+        del tcp_rx[:e + len(b"FRAME_END\n")]
+        if m and m.group(3) == b"JPG":
+            w_, h_ = int(m.group(1)), int(m.group(2))
+            if w_ > 0 and h_ > 0 and len(body) > 100 and body[:2] == b"\xff\xd8":
+                _route_jpeg_frame(body, w_, h_)
+
+
+def pump_tcp(tcp):
+    """TCP 单点非阻塞读取入口。半开/对端关闭时置死连接触发重连。"""
+    try:
+        data = tcp.recv(65536)
+    except (BlockingIOError, socket.timeout):
+        return
+    except OSError:
+        _tcp_dead(tcp)
+        return
+    if not data:
+        _tcp_dead(tcp)
+        return
+    _pump_bytes(data)
+
+
+def _tcp_dead(sock):
+    """TCP 对端半开/有序关闭: recv 返回空即连接已死, 置空触发 reader 重连。"""
+    if G.get("tcp") is sock:
+        G["tcp"] = None
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _clear_rxbuffers():
+    """切模式/重连后清掉所有重组残留。"""
+    global udp_ctx
+    udp_ctx = {"seq": None, "cnt": 0, "w": 0, "h": 0, "fmt": 0,
+               "parts": None, "got": 0}
+    tcp_rx.clear()
+
+
+def mode_cmd(code=None):
+    s = ("v" + code) if code else ""
+    return s + ("U" if G["mode"] == "UDP" else "N")
+
+
+def send_cmd(data):
+    c = G["tcp"]
+    payload = data.encode() if isinstance(data, str) else data
+    if c is None:
+        print("发送失败: 无命令通道", flush=True)
+        return False
+    try:
+        c.sendall(payload)
         return True
-    return False
+    except OSError as e:
+        print("发送失败:", e, flush=True)
+        return False
 
 
-def open_tcp_cmd():
-    """建连板子 TCP 并下发命令(切分辨率+开 UDP)；失败自动重试。"""
-    for _ in range(120):
-        if stop.is_set():
+def open_tcp_cmd(stop_ev):
+    for _ in range(600):
+        if stop_ev.is_set():
             return None
         try:
             c = socket.create_connection((host, port), timeout=4)
             c.settimeout(0.05)
-            c.sendall(res_cmd.encode())
+            c.sendall(mode_cmd(res_code).encode())
+            print(f"TCP 已连 {host}:{port}, 已发 {mode_cmd(res_code)!r}", flush=True)
             return c
-        except Exception:
+        except OSError:
             time.sleep(1.0)
     return None
 
 
-def reader():
-    # UDP:预览通道(无状态, 断帧靠心跳自恢复)
+def window_stats(win=STAT_WINDOW):
+    """最近 win 秒内的 (帧数, 字节数)。"""
+    t0 = time.time() - win
+    n = byt = 0
+    for t, b in reversed(samples):
+        if t < t0:
+            break
+        n += 1; byt += b
+    return n, byt
+
+
+def _reader_body(stop_ev):
+    """单次收流会话；异常交给外层 supervisor 捕获重启。"""
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+    except Exception:
+        pass
     udp.bind(("0.0.0.0", port))
     udp.settimeout(0.05)
     print(f"UDP 已监听 :{port}", flush=True)
-    tcp = open_tcp_cmd()
+
+    tcp = open_tcp_cmd(stop_ev)
     if tcp is None:
-        stop.set()
         udp.close()
         return
-    tcp_chan[0] = tcp                     # GUI 切分辨率命令走这条通道
-    print("已发 'U' 开启 UDP 预览, TCP 通道就绪", flush=True)
+    G["tcp"] = tcp
+    tcp.settimeout(0)
     last_good = time.time()
-    while not stop.is_set():
-        # 心跳自恢复：板子重启/失锁会停发, 超时后重发 'U' 让它回到 UDP 模式
-        if time.time() - last_good > RECONNECT_AFTER:
-            print("UDP 长时间无帧, 重新下发 'U' 恢复", flush=True)
+
+    while not stop_ev.is_set():
+        now = time.time()
+        # 停流超时判定在拍照窗口内让路: P 命令期间预览必然暂停数秒,
+        # 此时重连会把正在回传的照片流切断。
+        # 注意不依赖 G["tcp"] 非空: 连接被对端硬拆时它已被置 None,
+        # 以往这里会永远跳过重连且不打日志(静默假死)。
+        if (now - max(last_good, G["last_good"]) > RECONNECT_AFTER
+                and now >= G["photo_until"]):
+            print(f"[{G['mode']}] 停流超时, 重连重下发...", flush=True)
+            old = G["tcp"]
+            G["tcp"] = None
             try:
                 tcp.close()
             except Exception:
                 pass
-            tcp_chan[0] = None
-            tcp = open_tcp_cmd()
+            if old is not None and old is not tcp:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            _clear_rxbuffers()
+            tcp = open_tcp_cmd(stop_ev)
             if tcp is None:
                 break
-            tcp_chan[0] = tcp
-            print("恢复重连成功, 等待帧回来", flush=True)
+            G["tcp"] = tcp
+            tcp.settimeout(0)
             last_good = time.time()
-            ctx.clear(); ctx.update(seq=None, cnt=0, w=0, h=0, fmt=0, parts=None, got=0)
-        try:
-            pkt, _addr = udp.recvfrom(65535)
-        except socket.timeout:
-            time.sleep(0.002)
-            continue
-        except OSError:
-            break
-        if udp_feed(pkt):
-            last_good = time.time()
-        # 每 3 秒终端打印一次帧率
-        now = time.time()
-        if now - fps_state["t"] >= 3.0:
-            fps = (frame_count[0] - fps_state["n"]) / (now - fps_state["t"])
-            name = "JPEG" if fps_state["fmt"] == 1 else "RGB565"
-            print(f"fps={fps:6.1f}  {fps_state['w']}x{fps_state['h']} {name}  累计帧 {frame_count[0]}", flush=True)
-            fps_state["t"], fps_state["n"] = now, frame_count[0]
-    udp.close()
-    tcp_chan[0] = None
+
+        if G["mode"] == "UDP":
+            got = completed = closed = False
+            while True:
+                try:
+                    pkt, _addr = udp.recvfrom(65535)
+                except socket.timeout:
+                    break
+                except OSError:
+                    closed = True
+                    break
+                got = True
+                if udp_feed(pkt):
+                    completed = True
+            if completed:
+                last_good = time.time()
+            if not got:
+                time.sleep(0.002)
+            if closed:
+                break
+            if G["tcp"]:
+                pump_tcp(G["tcp"])
+        else:
+            n0 = len(samples)
+            if G["tcp"]:
+                pump_tcp(G["tcp"])
+            if len(samples) != n0:
+                last_good = time.time()
+
+        if time.time() - stat_t[0] >= 3.0:
+            n, byt = window_stats()
+            print(f"{G['mode']:>3} fps={n / STAT_WINDOW:6.1f} kb={(byt / 1024) / STAT_WINDOW:5.0f}/s "
+                  f"累计 {G['frames']} 丢帧 {G['drops']}", flush=True)
+            stat_t[0] = time.time()
+
     try:
-        tcp.close()
+        udp.close()
+    except Exception:
+        pass
+    G["tcp"] = None
+
+
+def reader(stop_ev):
+    """supervisor：收流线程任何未捕获异常都会被拉起重启，稳定性优先。
+
+    已知妥协: 异常路径下旧 UDP socket 依赖进程退出/GC 回收, REUSEADDR 保证重绑不失败。"""
+    while not stop_ev.is_set():
+        try:
+            _reader_body(stop_ev)
+            return                       # body 正常返回(如连续连不上)时按原语义结束
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            G["tcp"] = None
+            print("reader 异常, 2s 后自动重启收流线程", flush=True)
+            if stop_ev.wait(2.0):
+                return
+
+
+# ================= 无 GUI 自检 =================
+def run_selftest():
+    import random
+    random.seed(7)
+
+    def jhdr(nchunks_minus1, idx, seq=1234, w=320, h=240, fmt=1):
+        return (MAGIC + bytes([fmt])
+                + bytes([(seq >> 8) & 0xFF, seq & 0xFF])
+                + bytes([nchunks_minus1, idx])
+                + bytes([(w >> 8) & 0xFF, w & 0xFF, (h >> 8) & 0xFF, h & 0xFF]))
+
+    # 1) JPEG 多分片重组
+    body = b"\xff\xd8" + bytes(random.randrange(256) for _ in range(CHUNK * 3 + 77)) + b"\xff\xd9"
+    chunks = [body[i:i + CHUNK] for i in range(0, len(body), CHUNK)]
+    assert any(udp_feed(jhdr(len(chunks) - 1, i) + ch) for i, ch in enumerate(chunks)), \
+        "多分片 JPEG 应恰好重组出一帧"
+    ffmt, fr, fw_, fh_ = prev_q.get_nowait()
+    assert ffmt == 1 and fr == body and (fw_, fh_) == (320, 240), "重组内容不符"
+
+    # 2) 起始标记损坏应拒收
+    bad = b"\xff\xd9garbage" + b"\x01" * 200 + b"\xff\xd9"
+    assert udp_feed(jhdr(0, 0, seq=555) + bad) is False, "坏头 JPEG 应回复 False"
+    assert prev_q.qsize() == 0, "坏帧不得入队"
+
+    # 3) RGB 尺寸校验: 声明 64x32 但数据不足 -> 拒收
+    short = jhdr(0, 0, seq=777, w=64, h=32, fmt=0) + b"\x00" * 100
+    assert udp_feed(short) is False, "RGB 尺寸不足应拒收"
+
+    # 4) RGB 正确长度(4x4=32B 单片) -> 入队且内容一致
+    rgb = bytes(random.randrange(256) for _ in range(32))
+    assert udp_feed(jhdr(0, 0, seq=888, w=4, h=4, fmt=0) + rgb), "合法 RGB 应成帧"
+    ffmt2, fr2, w2, h2 = prev_q.get_nowait()
+    assert (ffmt2, fr2, w2, h2) == (0, rgb, 4, 4), "RGB 帧内容不符"
+
+    # 5) numpy 与纯 Python 转换一致性
+    if np is not None:
+        raw = bytes(random.randrange(256) for _ in range(64 * 32 * 2))
+        ref = bytearray()
+        for o in range(0, len(raw), 2):
+            v = (raw[o] << 8) | raw[o + 1]
+            r = (v >> 11) & 0x1F; g = (v >> 5) & 0x3F; b = v & 0x1F
+            ref.append((r * 255 + 15) // 31); ref.append((g * 255 + 31) // 63); ref.append((b * 255 + 15) // 31)
+        fast = convert_rgb(raw, 64, 32)
+        assert fast == bytes(ref), "numpy 与参考实现不一致"
+    # 6) TCP 统一解复用: 单缓冲按帧单元解析, 预览/照片正确路由且任意切分不损坏
+    def unit(w_, h_, payload):
+        return b'FRAME_BEGIN\nSIZE %d %d JPG\n' % (w_, h_) + payload + b'FRAME_END\n'
+    prev_body = b"\xff\xd8" + bytes(random.randrange(256) for _ in range(300)) + b"\xff\xd9"
+    photo_body = b"\xff\xd8" + bytes(random.randrange(256) for _ in range(450)) + b"\xff\xd9"
+    stream = unit(320, 240, prev_body) + unit(1600, 1200, photo_body)
+    for piece in (stream[:77], stream[77:800], stream[800:1300], stream[1300:]):
+        _pump_bytes(piece)                    # 前1.5帧: pending=False -> 预览通道
+    assert prev_q.qsize() == 2 and photo_q.qsize() == 0, "pending=False 应全走预览"
+    f_, fr_, fw2_, fh2_ = prev_q.get_nowait()
+    assert (fw2_, fh2_) == (320, 240) and fr_ == prev_body, "预览单元内容不符"
+    while not prev_q.empty():             # 清掉第二预览单元, 保证下个用例初始态干净
+        prev_q.get_nowait()
+    del tcp_rx[:]
+    G["photo_pending"] = True
+    mixed = b'\xff\xd8junk' + unit(1600, 1200, photo_body)   # 前缀杂散文本应被跳过
+    for piece in (mixed[:200], mixed[200:]):
+        _pump_bytes(piece)
+    assert photo_q.qsize() == 1 and prev_q.qsize() == 0, "pending=True 应路由到照片"
+    pb, pw, ph_ = photo_q.get_nowait()
+    assert pw == 1600 and pb == photo_body, "照片单元内容不符"
+    assert G["photo_pending"] is False, "收到照片后应自动清 pending"
+    print("PASS: TCP 解复用路由与抗劈裂")
+
+    print("SELFTEST OK")
+
+
+# ================= GUI =================
+if SELFTEST:
+    run_selftest()
+    sys.exit(0)
+
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk
+
+ui = {}          # 控件句柄/渲染状态集中存放
+
+
+def build_ui(root):
+    ui["root"] = root
+    root.title(f"OV2640 实时预览 [{host}:{port}]")
+
+    # ---- 工具栏 ----
+    bar = ttk.Frame(root); bar.pack(fill="x", padx=6, pady=(6, 0))
+
+    ttk.Label(bar, text="传输:").pack(side="left")
+    mode_cb = ttk.Combobox(bar, values=["UDP", "TCP"], state="readonly", width=6)
+    mode_cb.set("UDP"); mode_cb.pack(side="left", padx=(4, 10))
+    ui["mode_cb"] = mode_cb
+
+    ttk.Label(bar, text="预览:").pack(side="left")
+    res_cb = ttk.Combobox(bar, values=RES_LABELS, state="readonly", width=9)
+    res_cb.set(res_label("QVGA")); res_cb.pack(side="left", padx=(4, 10))
+    ui["res_cb"] = res_cb
+
+    ttk.Label(bar, text="画质:").pack(side="left")
+    q_var = tk.IntVar(value=10)
+    q_scale = ttk.Scale(bar, from_=8, to=40, variable=q_var, length=110)
+    q_scale.pack(side="left", padx=(4, 2))
+    q_lbl = ttk.Label(bar, text=str(q_var.get()), width=3)
+    q_lbl.pack(side="left", padx=(0, 10))
+    ui["q_var"], ui["q_lbl"] = q_var, q_lbl
+
+    ttk.Label(bar, text="拍照:").pack(side="left")
+    photo_cb = ttk.Combobox(bar, values=RES_LABELS, state="readonly", width=9)
+    photo_cb.set(res_label("UXGA")); photo_cb.pack(side="left", padx=(4, 4))
+    ui["photo_cb"] = photo_cb
+
+    photo_btn = ttk.Button(bar, text="拍照", command=lambda: take_photo())
+    photo_btn.pack(side="left", padx=(0, 8))
+    ui["photo_btn"] = photo_btn
+
+    snap_btn = ttk.Button(bar, text="存图(Ctrl+S)", command=snapshot)
+    snap_btn.pack(side="left")
+
+    # ---- 视频区 ----
+    video = tk.Label(root, bg="#101010", width=88, height=30)
+    video.pack(padx=6, pady=4, fill="both", expand=True)
+    ui["video"] = video
+
+    # ---- 状态栏 ----
+    foot = ttk.Frame(root); foot.pack(fill="x", padx=6, pady=(0, 6))
+    badge = tk.Label(foot, text=" 连接中 ", fg="white", bg="#c60", padx=6)
+    badge.pack(side="left")
+    info = ttk.Label(foot, text="-", anchor="w")
+    info.pack(side="left", fill="x", expand=True, padx=8)
+    tip = ttk.Label(foot, text="Ctrl+Q 退出", foreground="#888")
+    tip.pack(side="right")
+    ui["badge"], ui["info"] = badge, info
+
+    # ---- 事件绑定 ----
+    def on_mode(_ev=None):
+        G["mode"] = mode_cb.get()
+        _clear_rxbuffers()
+        if G["mode"] == "TCP":
+            prev_q.queue.clear()          # 切 TCP 清掉 UDP 残留画面
+        cmd = mode_cmd(code_of(res_cb.get()))
+        if send_cmd(cmd):
+            print(f"模式切换 -> {G['mode']}: {cmd!r}", flush=True)
+    mode_cb.bind("<<ComboboxSelected>>", on_mode)
+
+    def on_res(_ev=None):
+        cmd = mode_cmd(code_of(res_cb.get()))
+        if send_cmd(cmd):
+            print(f"分辨率 -> {res_cb.get()}: {cmd!r}", flush=True)
+    res_cb.bind("<<ComboboxSelected>>", on_res)
+
+    # 拖动中不发，松手才发一次（固件按单字节二进制值解析画质）
+    def on_q_release(_ev=None):
+        v = max(8, min(40, int(q_var.get())))
+        q_lbl.config(text=str(v))
+        if send_cmd(bytes([v])):
+            print(f"quality -> {v}", flush=True)
+    q_scale.bind("<ButtonRelease-1>", on_q_release)
+
+    root.bind("<Control-q>", lambda e: close())
+    root.bind("<Control-s>", lambda e: snapshot())
+    root.protocol("WM_DELETE_WINDOW", close)
+
+
+def take_photo():
+    if time.time() < G["photo_until"]:
+        return
+    code = code_of(ui["photo_cb"].get())
+    if not send_cmd(f"H{code}\nP".encode()):
+        return
+    G["photo_until"] = time.time() + 15.0     # UXGA 拍照+传输留足时间
+    G["photo_pending"] = True                 # 下一个完整 TCP 帧单元路由给照片
+    btn = ui["photo_btn"]
+    btn.state(["disabled"]); btn.config(text=f"拍照中({code})…")
+    ui["info"].config(text=f"拍照 {ui['photo_cb'].get()} 中，回传走可靠通道…")
+
+
+def finish_photo(msg_ok):
+    G["photo_pending"] = False
+    btn = ui["photo_btn"]
+    btn.state(["!disabled"]); btn.config(text="拍照")
+    if not msg_ok:
+        ui["info"].config(text="拍照超时/失败，可重试")
+
+
+def save_jpeg_bytes(raw, prefix, w, h):
+    os.makedirs(PHOTO_DIR, exist_ok=True)
+    fn = os.path.join(PHOTO_DIR, "%s_%s_%dx%d.jpg"
+                      % (prefix, time.strftime("%Y%m%d_%H%M%S"), w, h))
+    with open(fn, "wb") as f:                 # 板子给的已是 JPEG, 直写不重编码
+        f.write(raw)
+    return fn
+
+
+# ---- 色彩异常看门狗 ----
+# OV2640 的 DSP 寄存器状态可能被写坏(白平衡预设表与部分模块不兼容), 表现为整幅
+# 蓝紫色偏(实测白桌 R185/G142/B254)且无法通过 w0 恢复, 只有固件 'r' 完整重建才痊愈。
+# 监测中心区域均值: B 同时高出 R/G 达阈值并持续 ~3s -> 下发 'r' 自动重建。
+CW = {"t": 0.0, "bad": 0, "cooldown": 0.0}
+
+
+def watch_color(img):
+    try:
+        _watch_color_impl(img)
+    except Exception as e:
+        CW["bad"] = 0
+        print("[watchdog] 内部异常已忽略:", e, flush=True)
+
+
+def _watch_color_impl(img):
+    now = time.time()
+    if now < CW["t"] + 1.0 or now < CW["cooldown"]:
+        return
+    CW["t"] = now
+    try:
+        rgb = img.convert("RGB").crop((img.width // 4, img.height // 4,
+                                       img.width * 3 // 4, img.height * 3 // 4))
+        px = list(rgb.resize((24, 24)).getdata())
+        r = sum(p[0] for p in px) / len(px)
+        g = sum(p[1] for p in px) / len(px)
+        b = sum(p[2] for p in px) / len(px)
+    except Exception:
+        return
+    if b - r > 40 and b - g > 40:
+        CW["bad"] += 1
+    else:
+        CW["bad"] = 0
+        return
+    if CW["bad"] >= 3:
+        CW["bad"] = 0
+        CW["cooldown"] = now + 12.0
+        if not G.get("photo_pending") and send_cmd(b"r"):
+            print("[watchdog] 检测到蓝紫色偏, 已下发传感器重建", flush=True)
+            info = ui.get("info")
+            if info is not None:
+                info.config(text="检测到色彩异常(紫屏), 已自动重建摄像头")
+
+
+def show_on_video(img):
+    """等比缩放铺进视频区并刷新 Label。"""
+    watch_color(img)
+    vw = max(ui["video"].winfo_width(), 320)
+    vh = max(ui["video"].winfo_height(), 240)
+    img = img.copy()
+    img.thumbnail((vw, vh))
+    ph = ImageTk.PhotoImage(img)
+    lb = ui["video"]
+    lb.config(image=ph, width=img.width, height=img.height)
+    lb.image = ph                             # 防 GC 回收
+
+
+def handle_photo(raw, w, h):
+    G["photo_until"] = 0.0
+    fn = save_jpeg_bytes(raw, "photo", w, h)
+    print("已保存照片:", fn, flush=True)
+    try:
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        # 存盘已成功; 仅解码失败不让 Tk 回调链崩掉
+        finish_photo(True)
+        ui["info"].config(text=f"已保存但预览解码失败: {e}")
+        return
+    show_on_video(img)
+    finish_photo(True)
+    ui["info"].config(text=f"已保存照片 {fn}")
+
+
+def snapshot():
+    last = ui.get("last_frame")
+    if not last:
+        return
+    fmt, raw, w, h = last
+    os.makedirs(PHOTO_DIR, exist_ok=True)
+    if fmt == 1:
+        fn = save_jpeg_bytes(raw, "snap", w, h)
+    else:
+        img = Image.frombytes("RGB", (w, h), convert_rgb(raw, w, h))
+        fn = os.path.join(PHOTO_DIR, "snap_%s_%dx%d.png" % (time.strftime("%Y%m%d_%H%M%S"), w, h))
+        img.save(fn)
+    ui["info"].config(text=f"已存图 {fn}")
+    print("已存图:", fn, flush=True)
+
+
+def close():
+    G["stop"].set()
+    try:
+        ui["root"].destroy()
     except Exception:
         pass
 
 
-def render():
+def render_loop(root):
+    stop_ev = G["stop"]
+
+    # 1) 拍照帧优先处理(不可丢)
     try:
-        fmt, raw, w, h = q.get_nowait()
-        if raw:
-            if fmt == 1:                      # JPEG -> 直接解码
-                img = Image.open(io.BytesIO(raw))
-                img = img.convert("RGB")
-            else:                             # RGB565 big-endian
-                img = Image.frombytes("RGB", (w, h), convert_rgb(raw, w, h))
-            scale = max(1, 640 // max(w, 1))
-            big = img.resize((w * scale, h * scale), Image.NEAREST)
-            photo = ImageTk.PhotoImage(big)
-            label.config(image=photo)
-            label.image = photo
-            elapsed = time.time() - start_t[0]
-            fps = frame_count[0] / elapsed if elapsed > 0 else 0
-            fps_lbl.config(text=f"UDP {'JPEG' if fmt == 1 else 'RGB565'} 帧率 {fps:.1f} fps | 帧数 {frame_count[0]} | {w}x{h}")
+        while True:
+            raw, w, h = photo_q.get_nowait()
+            handle_photo(raw, w, h)
     except queue.Empty:
         pass
-    except Exception:
-        import traceback; traceback.print_exc()
-    root.after(15, render)
 
+    # 2) 拍照互斥超时释放
+    if G["photo_until"] and time.time() > G["photo_until"]:
+        G["photo_until"] = 0.0
+        finish_photo(False)
 
-root = tk.Tk()
-root.title(f"OV2640 UDP 预览帧率测试 [{host}:{port}]")
-label = tk.Label(root, bg="black")
-label.pack()
-fps_lbl = tk.Label(root, text="连接中...", anchor="w", padx=6)
-fps_lbl.pack(fill="x")
-
-# 控制栏: 分辨率下拉框(点击即切, 自动重开 UDP)
-ctrl = ttk.Frame(root)
-ctrl.pack(fill="x", padx=6, pady=4)
-ttk.Label(ctrl, text="分辨率:").pack(side="left")
-res_cb = ttk.Combobox(ctrl, values=list(RES_MAP.keys()), state="readonly", width=8)
-res_cb.set("QVGA")
-res_cb.pack(side="left", padx=(4, 12))
-ttk.Label(ctrl, text="(切换后自动重开 UDP)", foreground="#888").pack(side="left")
-
-def on_res(_ev=None):
-    code = RES_MAP.get(res_cb.get())
-    if not code or tcp_chan[0] is None:
-        return
+    # 3) 预览: 排空队列只画最新一帧
+    latest = None
     try:
-        # 'v<分辨率码>' 切分辨率; 再补 'U' 确保仍在 UDP 预览模式
-        tcp_chan[0].sendall(("v" + code + "\nU").encode())
-        print(f"切换分辨率 -> {res_cb.get()}({code}), 已重开 UDP", flush=True)
-    except Exception as e:
-        print("切换失败:", e, flush=True)
-res_cb.bind("<<ComboboxSelected>>", on_res)
+        while True:
+            latest = prev_q.get_nowait()
+    except queue.Empty:
+        pass
+    if latest:
+        fmt, raw, w, h = latest
+        ui["last_frame"] = latest
+        try:
+            if fmt == 1:
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+            else:
+                img = Image.frombytes("RGB", (w, h), convert_rgb(raw, w, h))
+            show_on_video(img)
+        except Exception as e:
+            ui["info"].config(text=f"解码异常: {e}")
 
-root.bind("<Control-q>", lambda e: (stop.set(), root.destroy()))
-th = threading.Thread(target=reader, daemon=True)
-th.start()
-root.after(15, render)
-root.mainloop()
-stop.set()
-print("退出", flush=True)
+    # 4) 状态栏节流刷新(4Hz)
+    now = time.time()
+    if now - ui.get("_st", 0) >= 0.25:
+        ui["_st"] = now
+        n, byt = window_stats()
+        fps = n / STAT_WINDOW
+        kbps = (byt / 1024) / STAT_WINDOW
+        mode = G["mode"]
+        res = ui["res_cb"].get()
+        connected = G["tcp"] is not None
+        alive = connected and (now - G["last_good"] < RECONNECT_AFTER)
+        badge = ui["badge"]
+        if alive:
+            badge.config(text=" ● 实时 ", bg="#0a0")
+        elif connected:
+            badge.config(text=" ◐ 等帧 ", bg="#c60")
+        else:
+            badge.config(text=" ○ 未连 ", bg="#a33")
+        note = ""
+        if now < G["photo_until"]:
+            note = " | 拍照中…"
+        ui["info"].config(text=f"{mode} {res}  {fps:5.1f} fps  {kbps:4.0f} KB/s  "
+                               f"帧计 {G['frames']} 丢帧 {G['drops']}{note}")
+
+    if not stop_ev.is_set():
+        root.after(15, render_loop, root)
+
+
+def main():
+    root = tk.Tk()
+    build_ui(root)
+    th = threading.Thread(target=reader, args=(G["stop"],), daemon=True)
+    th.start()
+    root.after(200, render_loop, root)
+    root.mainloop()
+    G["stop"].set()
+    print("退出", flush=True)
+
+
+if __name__ == "__main__":
+    main()

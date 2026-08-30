@@ -65,6 +65,10 @@ fw = fh = ffmt = 0
 if mode == "udp":
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)  # 4MB 接收缓冲, 减少高速分片丢包
+    except Exception:
+        pass
     udp.bind(("0.0.0.0", port))
     udp.settimeout(0.05)
     ctx = {"seq": None, "cnt": 0, "got": 0, "parts": None}

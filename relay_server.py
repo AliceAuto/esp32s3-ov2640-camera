@@ -1,0 +1,217 @@
+# -*- coding: utf-8 -*-
+"""
+OV2640 跨网信令 + 中继服务端。
+================================
+作用: 当摄像头和终端不在同一局域网时, 通过本公网服务端完成:
+  1. 设备在线注册 / 心跳 / 列表查询   (信令)
+  2. 终端与摄像头之间的双向字节转发   (中继)
+
+架构: 
+  摄像头(CAM)与终端(VIEWER)都以 TCP 连接到本服务端。
+  - CAM 上线后发 reg 把自己注册为一个在线设备, 并保持此连接作为数据上行通道。
+  - VIEWER 发 list 查在线设备, 发 watch <id> 请求观看某台摄像头。
+  - SERVER 在 CAM 与 VIEWER 两条 TCP 连接之间建立双向转发: 
+       摄像头帧上行(->viewer 收)  终端命令下行(->camera 收)。
+  - 数据是纯字节透传, 服务端不解析视频帧, 因此与固件现有 FRAME/SIZE/END 协议解耦。
+
+协议:                     长度前缀 + payload
+  所有消息为: 4字节大端长度 L + L 字节 payload。
+  payload 是 UTF-8 文本时: 必须以 JSON 格式出现(首字符 '{')。
+  payload 是二进制时:     非 JSON(首字符非 '{'), 视为视频/命令字节流, 只中继不解析。
+
+消息(JSON):
+  CAM  -> SRV:  {"t":"reg", "id":"cam-xxx", "name":"客厅摄像头"}
+  CAM  -> SRV:  {"t":"hb"}                                   (心跳)
+  VIEWER-> SRV: {"t":"list"}
+  SRV  -> VIEWER: {"t":"devices", "devices":[{"id","name","online","since"}]}
+  VIEWER-> SRV: {"t":"watch", "id":"cam-xxx"}
+  SRV  -> VIEWER: {"t":"watch_ok"}  或 {"t":"error","msg":"..."}
+  SRV  -> CAM:   {"t":"viewer_attached"}      (有观众接入, CAM 开始推流)
+  SRV  -> CAM:   {"t":"viewer_left"}
+  之后 CAM/VIEWER 之间发起的非 JSON 字节将双向透传(见上)。
+
+用法:  python relay_server.py [port]
+默认端口 8000。需在云服务器防火墙/安全组放行 TCP 8000。
+"""
+import sys, threading, time, json, socket, traceback
+from collections import OrderedDict
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+
+# ---------------------------------------------------------------------------
+# 连接对象: 持有 socket + 身份(device / viewer) + 转发对端
+# ---------------------------------------------------------------------------
+class Conn:
+    def __init__(self, sock, addr, srv):
+        self.sock = sock
+        self.addr = addr
+        self.srv = srv
+        self.buf = b""
+        self.device_id = None      # 若是摄像头: 注册 id
+        self.is_camera = False
+        self.peer = None           # 中继对端连接
+        self.running = True
+        self.pause_peer = False    # 转发暂停标记(供接收线程用)
+
+    def send_payload(self, payload: bytes):
+        if not self.running:
+            return
+        try:
+            self.sock.sendall(len(payload).to_bytes(4, "big") + payload)
+        except OSError:
+            self.close()
+
+    def send_json(self, obj):
+        self.send_payload(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def close(self):
+        if not self.running:
+            return
+        self.running = False
+        self.srv.detach(self)
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class Server:
+    def __init__(self, port):
+        self.port = port
+        self.devices = OrderedDict()   # id -> Conn
+        self.lock = threading.Lock()
+
+    def detach(self, conn):
+        """连接关闭时: 解除设备注册、断开中继对端。"""
+        with self.lock:
+            if conn.device_id and self.devices.get(conn.device_id) is conn:
+                del self.devices[conn.device_id]
+                self.log(f"设备离线: {conn.device_id}")
+        # 通知/断开对端
+        peer = conn.peer
+        if peer is not None:
+            if peer.is_camera and peer.running:
+                peer.send_json({"t": "viewer_left"})
+            peer.peer = None
+            conn.peer = None
+            # 对端若是观众, 直接断开; 是摄像头则保留等下一个观众
+            if not peer.is_camera:
+                peer.close()
+
+    def log(self, msg):
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+    # ---- 协议处理 ----
+    def on_message(self, c: Conn, payload: bytes):
+        if payload[:1] == b"{" and payload.rstrip()[:1] == b"{" and b"}" in payload:
+            try:
+                msg = json.loads(payload.decode("utf-8"))
+            except Exception:
+                return  # 非完整 JSON, 忽略
+            self.handle_json(c, msg)
+        else:
+            # 二进制流: 中继给对端(观众命令上行, 摄像头数据下行)
+            if c.peer is not None:
+                c.peer.send_payload(payload)
+
+    def handle_json(self, c: Conn, msg: dict):
+        t = msg.get("t")
+        if t == "reg":
+            if c.is_camera:
+                return
+            c.device_id = msg.get("id") or f"cam-{c.addr[1]}"
+            c.is_camera = True
+            name = msg.get("name") or c.device_id
+            with self.lock:
+                self.devices[c.device_id] = c
+            self.log(f"设备注册: {c.device_id} name={name} from {c.addr}")
+            c.send_json({"t": "reg_ok", "id": c.device_id})
+        elif t == "hb":
+            pass  # 连接存活本身就是心跳
+        elif t == "list":
+            if c.is_camera:
+                return
+            now = time.time()
+            with self.lock:
+                devs = [{"id": d.device_id,
+                         "name": d.device_id,
+                         "online": bool(d.running),
+                         "since": int(now)} for d in self.devices.values()]
+            c.send_json({"t": "devices", "devices": devs})
+        elif t == "watch":
+            if c.is_camera:
+                return
+            target_id = msg.get("id")
+            with self.lock:
+                cam = self.devices.get(target_id)
+            if cam is None or not cam.running:
+                c.send_json({"t": "error", "msg": "device offline"})
+                return
+            # 抢占式: 摄像头只服务一个观众
+            old_peer = cam.peer
+            if old_peer is not None and old_peer != c:
+                with self.lock:
+                    old_peer.send_json({"t": "error", "msg": "busy elsewhere"})
+                old_peer.close()
+            cam.peer = c
+            c.peer = cam
+            cam.send_json({"t": "viewer_attached"})
+            c.send_json({"t": "watch_ok"})
+            self.log(f"观众 {c.addr} 观看 {target_id}")
+
+    def _recv_exact(self, c: Conn, n: int):
+        """读满 n 字节; 返回空 bytes 表示连接已关闭/出错。"""
+        data = b""
+        while len(data) < n:
+            try:
+                chunk = c.sock.recv(n - len(data))
+            except OSError:
+                return b""
+            if not chunk:
+                return b""
+            data += chunk
+        return data
+
+    def handle(self, c: Conn):
+        try:
+            while c.running:
+                head = self._recv_exact(c, 4)
+                if not head:
+                    return
+                ln = int.from_bytes(head, "big")
+                if ln > 64 << 20:
+                    return
+                payload = self._recv_exact(c, ln)
+                if not payload and ln:
+                    return
+                self.on_message(c, payload)
+        finally:
+            c.close()
+
+    def accept_loop(self, listener):
+        while True:
+            sock, addr = listener.accept()
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            c = Conn(sock, addr, self)
+            threading.Thread(target=self.handle, args=(c,), daemon=True).start()
+
+    def serve(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", self.port))
+        listener.listen(32)
+        self.log(f"relay_server 监听 0.0.0.0:{self.port} (放行 TCP {self.port})")
+        try:
+            self.accept_loop(listener)
+        except KeyboardInterrupt:
+            self.log("exit")
+        finally:
+            listener.close()
+
+
+if __name__ == "__main__":
+    Server(PORT).serve()

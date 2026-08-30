@@ -1,37 +1,49 @@
-# 编译产物
+# ========== 编译产物 ==========
+# Arduino/PlatformIO 构建目录（所有变体）
 esp32s3_camera_serial/build/
-esp32s3_camera_serial/build_out/
-host/__pycache__/
+esp32s3_camera_serial/build*/
+esp32s3_camera_pio/.pio/
+esp32s3_camera_pio/.pio/libdeps/
+
+# 编译输出文件
 *.bin
 *.elf
+*.map
+*.a
+*.o
+*.d
+*.su
 
-# Arduino 本地工具链（体积大，无需入库）
+# ========== 日志文件 ==========
+*.log
+
+# ========== 图片/视频输出 ==========
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
+
+# ========== Python 产物 ==========
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+
+# ========== 工具链（体积大，本地安装） ==========
 tools/*.zip
 tools/package_esp32_index_local.json
 tools/arduino-cli.exe
 
-# 资料解压产物与原始压缩包可留，但很大，按需是否入库
-资料/extracted/
+# ========== 厂商资料（体积大，无需入库） ==========
+资料/
 
-# 截图输出
+# ========== 上位机输出 ==========
 esp32s3_camera_serial/host/shots/
-
-# PlatformIO 构建产物与依赖（体积大，无需入库）
-esp32s3_camera_pio/.pio/
-esp32s3_camera_pio/.pio/libdeps/
-
-# 旧串口工程库源码副本（不参与编译, arduino-cli 链接预编译库）
-esp32s3_camera_serial/libraries/
-
-# 旧串口工程残留构建/日志
-esp32s3_camera_serial/build_*/
-esp32s3_camera_serial/buildj/
-esp32s3_camera_serial/buildn/
-esp32s3_camera_serial/buildn_verbose.log
-esp32s3_camera_serial/verbose.log
-esp32s3_camera_serial/vl.log
-esp32s3_camera_serial/vl_src.log
-
-# 上位机产物
-esp32s3_camera_serial/host/__pycache__/
 esp32s3_camera_serial/host/photos/
+
+# ========== 库源码副本 ==========
+esp32s3_camera_serial/libraries/
