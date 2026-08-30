@@ -11,7 +11,7 @@
 | 传感器 | OV2640（200万像素 DVP 摄像头） |
 | 主控 | ESP32-S3（8MB PSRAM，片外帧缓冲） |
 | 图像格式 | **JPEG（默认，高压缩）/ RGB565（big-endian）可切换** |
-| 数据传输 | WiFi TCP/UDP（局域网 IP:3333）或 串口 UART0 2,000,000 baud |
+| 数据传输 | WiFi TCP/UDP（局域网 IP:3333）或 串口 UART0 2,000,000 baud；**局域网 UDP 广播自动发现 + 跨网中继服务端** |
 | 预览分辨率 | 默认 QQVGA 160×120（可切 QVGA/VGA） |
 | 拍照分辨率 | 默认 **UXGA 1600×1200**（可切 VGA/SVGA/XGA/UXGA） |
 | 帧缓冲 | PSRAM，按分辨率自适应 1/2 缓冲 |
@@ -155,7 +155,8 @@ $pio = "C:\Users\27427\AppData\Local\Programs\Python\Python311\Scripts\pio.exe"
 
 | 脚本 | 用途 |
 | ---- | ---- |
-| **`live_capture.py`** | **主程序**：实时预览 GUI + 下拉切换预览/拍照分辨率 + 一键拍照存图 + **自动重连**。用法：`python live_capture.py COM7 [baud]` 或 `--wifi <IP> 3333` |
+| **`live_capture.py`** | **主程序**：实时预览 GUI + 下拉切换预览/拍照分辨率 + 一键拍照存图 + **自动重连**。用法：`python live_capture.py COM7 [baud]`、`--auto`（局域网自动发现）、`--wifi <IP> 3333`、`--relay 服务器:端口 [--id 设备ID]`（跨网观看） |
+| **`relay_server.py`** | **跨网信令+中继服务端**（项目根目录）：摄像头注册/终端查列表/watch/双向字节中继。用法：`python relay_server.py 8000`，需云服务器放行 TCP 端口 |
 | **`udp_capture.py`** | **JPEG 高帧率预览**：走 UDP 通道（丢帧不重传）+ JPEG 解码，帧率明显高于 TCP。用法：`python udp_capture.py --wifi <IP> 3333` |
 | `verify_switch.py` | 自动验证：预览切 QVGA、拍照切 UXGA、切回 QQVGA 的无头验证脚本 |
 | `hi_res_capture.py` | UXGA 无头抓拍教程脚本 |
@@ -222,6 +223,36 @@ $pio = "C:\Users\27427\AppData\Local\Programs\Python\Python311\Scripts\pio.exe"
 ### 模式二：AP 热点直连（兜底）
 
 当不在局域网内（现场无路由）时，手机/电脑连接板子热点 `OV2640Cam`（无密码），上位机连 `192.168.4.1:3333`：`python live_capture.py --wifi 192.168.4.1 3333`。
+
+### 模式三：局域网自动发现（`--auto`，免填 IP）
+
+摄像头入网后每 3 秒向 **UDP 广播 `255.255.255.255:9999`** 一条 `OV2640|设备名|局域网IP`。上位机 `--auto` 监听同端口几秒即可自动发现并**直连**摄像头的 3333 端口，同一 WiFi 下无需再填 IP：
+
+```powershell
+python live_capture.py --auto
+```
+
+- 摄像头 **STA 需已连上同一 WiFi**（通过配网页 `http://192.168.4.1/` 填写目标 WiFi），否则收不到广播。
+- 与模式一本质相同（TCP 直连 P2P），只是省去了手动填 IP 这步。
+
+### 模式四：跨网远程观看（`--relay`，经公网服务端）
+
+当终端与摄像头**不在同一局域网**时，二者经公网 **中继服务端**（`relay_server.py`）完成注册与双向字节中继：
+
+```powershell
+# 云服务器上(放行 TCP 8000)
+python relay_server.py 8000
+
+# 终端远程观看(不指定 --id 则自动选第一台在线)
+python live_capture.py --relay 1.2.3.4:8000 --id cam-87A1B2
+```
+
+- **固件侧**：配网页填「中继服务端 IP:端口」后，摄像头常驻连接该服务端并注册为在线设备（`id` 可自定义，默认 `cam-<MAC尾>`）；有观众 `watch` 时开始把 `FRAME_BEGIN...FRAME_END` 帧作为中继消息上行，并把观众下行命令透传回命令处理器。断线自动重连。
+- **传输协议无关**：服务端只做**4B 大端长度前缀 + payload 的字节透传**，不解析视频帧，因此与局域网帧协议完全兼容——`--relay` 与 `--wifi`/`--auto` 共用同一套 `FRAME/SIZE/END` 帧解析。
+- 摄像头侧优先服务**本地 TCP 客户端**，无本地客户端时才走中继观众（一台摄像头同一时刻服务一个观看端）。
+- 本地联调可用 `host/selftest_relay.py` 模拟"摄像头+终端"跑通 reg/list/watch/双向转发全链路（无需公网）。
+
+> 摄像头 UDP:9999 广播与 TCP/UDP:3333 预览通道互不冲突；发现/中继均为可选功能，未配置中继时固件仅用于局域网。
 
 ### 注意事项
 

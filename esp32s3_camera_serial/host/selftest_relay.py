@@ -18,11 +18,17 @@ def recv_msg(sock, timeout=3):
     sock.settimeout(timeout)
     head = b""
     while len(head) < 4:
-        head += sock.recv(4 - len(head))
+        part = sock.recv(4 - len(head))
+        if not part:            # 连接被服务端关闭(EOF)
+            return None
+        head += part
     ln = int.from_bytes(head, "big")
     payload = b""
     while len(payload) < ln:
-        payload += sock.recv(ln - len(payload))
+        part = sock.recv(ln - len(payload))
+        if not part:
+            return None
+        payload += part
     return payload
 
 
@@ -79,15 +85,17 @@ def main():
     assert got == b"Vt", got
     passed.append("终端下行命令被中继到摄像头")
 
-    # ---- 摄像头离线 -> 终端被清 ----
+    # ---- 摄像头离线 -> 终端被断开 ----
     cam.close()
     time.sleep(0.6)
+    got = None
     try:
-        recv_msg(v, 1)
-        raise AssertionError("cam 离线后终端应被断开/无数据")
+        got = recv_msg(v, 1)
     except socket.timeout:
         pass
-    passed.append("摄像头上线后在线列表/离线回收正常")
+    if got is not None:
+        raise AssertionError(f"cam 离线后终端应被断开/无数据, got={got!r}")
+    passed.append("摄像头离线后终端被正确回收/断开")
 
     print("ALL PASS:")
     for p in passed:

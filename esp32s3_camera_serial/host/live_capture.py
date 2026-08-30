@@ -9,22 +9,47 @@ OV2640 实时预览 + 动态分辨率切换 + 拍照。
 用法: python live_capture.py COM7 [baud]
 快捷键: Ctrl+Q 退出
 """
-import sys, time, threading, queue, os, re, socket, io
+import sys, time, threading, queue, os, re, socket, io, json
 import serial
 from PIL import Image, ImageTk
 import tkinter as tk
 
 # ---- 传输通道选择 ----
-#   串口: python live_capture.py COM7 [baud]
-#   WiFi: python live_capture.py --wifi [host] [port]   (host 默认 192.168.4.1)
-_args = [x for x in sys.argv[1:] if x != "--wifi"]
-USE_WIFI = "--wifi" in sys.argv
-if USE_WIFI:
-    port = _args[0] if _args else "192.168.4.1"
-    baud = int(_args[1]) if len(_args) > 1 else 3333
+#   串口:   python live_capture.py COM7 [baud]
+#   WiFi:   python live_capture.py --wifi [host] [port]   (host 默认 192.168.4.1)
+#   自动:   python live_capture.py --auto                 (UDP广播发现后直连局域网摄像头)
+#   中继:   python live_capture.py --relay 中继服务器:端口 [--id 设备ID]
+_FLAGS = ("--wifi", "--auto", "--relay", "--id")
+if "--relay" in sys.argv:
+    MODE = "relay"
+elif "--auto" in sys.argv:
+    MODE = "auto"
+elif "--wifi" in sys.argv:
+    MODE = "wifi"
 else:
-    port = _args[0] if _args else "COM7"
-    baud = int(_args[1]) if len(_args) > 1 else 2000000
+    MODE = "serial"
+
+_auto_id = None
+if "--id" in sys.argv:
+    i = sys.argv.index("--id")
+    if i + 1 < len(sys.argv):
+        _auto_id = sys.argv[i + 1]
+
+_pos = [x for x in sys.argv[1:] if x not in _FLAGS and x != _auto_id]
+
+DISCOVERY_PORT = 9999
+if MODE == "wifi":
+    port = _pos[0] if _pos else "192.168.4.1"
+    baud = int(_pos[1]) if len(_pos) > 1 else 3333
+elif MODE == "relay":
+    port = _pos[0] if _pos else "127.0.0.1:8000"   # "host:port"
+    baud = 0
+elif MODE == "auto":
+    port = None
+    baud = 3333
+else:
+    port = _pos[0] if _pos else "COM7"
+    baud = int(_pos[1]) if len(_pos) > 1 else 2000000
 
 BEGIN = b"FRAME_BEGIN\n"
 END = b"FRAME_END\n"
@@ -73,21 +98,171 @@ def convert_rgb(frame):
 _FRAME_RE = re.compile(rb'FRAME_BEGIN\nSIZE (\d+) (\d+) (\w+)\n(.*?)FRAME_END\n', re.S)
 
 
+def discover_cameras(timeout=4.0):
+    """监听 UDP 9999 广播，收集 {ip: 设备名}。摄像头入网后每 3s 广播一次。"""
+    found = {}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except Exception:
+        pass
+    s.bind(("0.0.0.0", DISCOVERY_PORT))
+    s.settimeout(0.5)
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            data, _ = s.recvfrom(512)
+        except socket.timeout:
+            continue
+        except Exception:
+            break
+        txt = data.decode(errors="ignore")
+        if txt.startswith("OV2640|"):
+            p = txt.split("|")
+            if len(p) >= 3:
+                found[p[2]] = p[1]
+    s.close()
+    return found
+
+
+class RelayIo:
+    """把中继服务端的"4B大端长度+payload"消息流解包成与 serial 同名的字节流。
+    观众端: 连中继 -> list -> watch(建立观看) -> 持续读取摄像头帧消息。
+    write(): 下发命令(打包成一条中继消息)。"""
+    def __init__(self, host, port, dev_id):
+        self.s = socket.create_connection((host, port), timeout=5)
+        self.s.settimeout(0.05)
+        self.buf = b""     # 解包后待消费的 payload 字节(供 read)
+        self._rbuf = b""   # 原始 socket 字节(含长度前缀)
+        devs = self._handshake(dev_id)
+        print(f"经中继观看: {devs['id']} (via {host}:{port})", flush=True)
+    def _send_json(self, o):
+        b = json.dumps(o).encode()
+        self.s.sendall(len(b).to_bytes(4, "big") + b)
+    def _recv_exact(self, n):
+        data = b""
+        while len(data) < n:
+            d = self.s.recv(n - len(data))
+            if not d:
+                raise OSError("中继连接关闭")
+            data += d
+        return data
+    def _handshake(self, dev_id):
+        # 先清空可能残留的旧读缓冲, 再做 list/watch 握手
+        self._send_json({"t": "list"})
+        devs = json.loads(self._recv_exact(int.from_bytes(self._recv_exact(4), "big")))
+        devs = devs.get("devices", [])
+        if not devs:
+            raise RuntimeError("中继上无在线摄像头")
+        if dev_id:
+            target = next((d for d in devs if d["id"] == dev_id or d["name"] == dev_id), None)
+            if not target:
+                raise RuntimeError(f"中继无设备 {dev_id}; 可用: {[d['id'] for d in devs]}")
+        else:
+            target = devs[0]
+            print(f"中继在线: {[(d['id'], d.get('name')) for d in devs]}", flush=True)
+            print(f"未指定 --id, 自动选择第一个: {target['id']}", flush=True)
+        self._send_json({"t": "watch", "id": target["id"]})
+        r = json.loads(self._recv_exact(int.from_bytes(self._recv_exact(4), "big")))
+        if r.get("t") != "watch_ok":
+            raise RuntimeError("观看请求失败: " + r.get("msg", ""))
+        return target
+    def _read_one(self):
+        """读一条完整消息; 无数据(超时)返回 None; 断连返回 b''。"""
+        while len(self._rbuf) < 4:
+            try:
+                d = self.s.recv(4 - len(self._rbuf))
+            except socket.timeout:
+                return None
+            except OSError:
+                return b""
+            if not d:
+                return b""
+            self._rbuf += d
+        n = int.from_bytes(self._rbuf[:4], "big")
+        self._rbuf = self._rbuf[4:]
+        while len(self._rbuf) < n:
+            try:
+                d = self.s.recv(n - len(self._rbuf))
+            except socket.timeout:
+                return None
+            except OSError:
+                return b""
+            if not d:
+                return b""
+            self._rbuf += d
+        out, self._rbuf = self._rbuf[:n], self._rbuf[n:]
+        return out
+    def read(self, n):
+        while len(self.buf) < n:
+            msg = self._read_one()
+            if msg is None:
+                break
+            if not msg:
+                self.close()
+                break
+            if msg[:1] == b"{":
+                continue   # 服务端信令, 跳过
+            self.buf += msg
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+    def write(self, b):
+        if isinstance(b, str):
+            b = b.encode()
+        if not b:
+            return 0
+        self.s.sendall(len(b).to_bytes(4, "big") + b)
+        return len(b)
+    def flush(self):
+        pass
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+    def reset_input_buffer(self):
+        self.buf = b""
+        self._rbuf = b""
+        try:
+            self.s.setblocking(False)
+            while True:
+                if not self.s.recv(65536):
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                self.s.setblocking(True)
+            except Exception:
+                pass
+
+
 def open_serial():
-    """创建传输连接：串口用 serial.Serial，WiFi 用 socket 封装成同名接口。
+    """创建传输连接：串口用 serial.Serial，WiFi/UDP-发现 用 socket 封装成同名接口。
     返回 None 表示重试超时(上层 stop)。"""
-    if USE_WIFI:
-        host, portn = port, baud
+    if MODE == "auto":
+        print("正在局域网自动发现摄像头 (UDP:9999)...", flush=True)
+        cam = discover_cameras()
+        if not cam:
+            print("未发现摄像头。确认已与摄像头同一 WiFi 并已入网。", flush=True)
+            return None
+        host = list(cam.keys())[0]
+        print(f"发现 {len(cam)} 台: {cam}", flush=True)
+        return _make_socket_io(host, 3333)
+    if MODE == "relay":
+        host, _, portn = port.rpartition(":")
         for _ in range(60):
             if stop.is_set():
                 return None
             try:
-                s = socket.create_connection((host, portn), timeout=4)
-                s.settimeout(0.05)
-                return TcpIo(s)
-            except Exception:
-                time.sleep(1.0)   # WiFi: 板子可能还在复位/开机, 慢速重试
+                return RelayIo(host or "127.0.0.1", int(portn or 8000), _auto_id)
+            except Exception as e:
+                print("中继连接失败:", e, flush=True)
+                time.sleep(1.0)
         return None
+    if MODE == "wifi":
+        return _make_socket_io(port, baud)
     for _ in range(300):
         if stop.is_set():
             return None
@@ -99,6 +274,20 @@ def open_serial():
             return s
         except Exception:
             time.sleep(0.5)
+    return None
+
+
+def _make_socket_io(host, portn):
+    """TCP 直连摄像头(WiFi/UDP-发现共用)。返回 TcpIo 或 None。"""
+    for _ in range(60):
+        if stop.is_set():
+            return None
+        try:
+            s = socket.create_connection((host, portn), timeout=4)
+            s.settimeout(0.05)
+            return TcpIo(s)
+        except Exception:
+            time.sleep(1.0)   # WiFi: 板子可能还在复位/开机, 慢速重试
     return None
 
 

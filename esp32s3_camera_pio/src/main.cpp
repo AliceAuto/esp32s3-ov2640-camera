@@ -55,6 +55,10 @@ void wait_tx_idle(uint32_t timeout_ms);
 void sender_task(void *arg);
 void handle_web_root();
 void handle_web_save();
+void disc_task(void *arg);
+void relay_task(void *arg);
+bool send_frame_relay(camera_fb_t *fb);
+String default_dev_id();
 
 // UART0 = CH343 转串口所在通道（TX=GPIO43, RX=GPIO44），避免默认 Serial 走 USB-CDC。
 HardwareSerial Dbg(0);
@@ -100,6 +104,32 @@ static uint64_t    g_adapt_last_bytes = 0;
 // 否则差分遇到清零会产生下溢/0值，画质调节半失效
 static uint64_t    g_adapt_total_frames = 0;
 static uint64_t    g_adapt_total_bytes  = 0;
+
+// ---- 局域网自动发现 + 跨网中继客户端 ----
+#define DISCOVERY_PORT  9999          // 局域网广播发现端口
+static WiFiUDP      disc_udp;
+static uint32_t     g_disc_last_ms = 0;
+
+static char         g_dev_name[32]   = AP_SSID;  // 广播/注册用设备名(可在配网页改)
+static char         g_dev_id[40]     = "";       // 注册 id(默认 cam-<MAC后4字节>)
+static char         g_relay_host[80] = "";       // 中继服务端 "host:port", 空=关闭
+static WiFiClient   relay_cli;
+static SemaphoreHandle_t g_relay_tx  = NULL;     // 保护 relay 发送(信令与帧交错用)
+static volatile bool g_relay_viewer  = false;    // 有观众经中继在观看
+static volatile bool g_relay_online  = false;    // 已连上中继服务端
+
+// 中继链路收到的一整条命令数据; 用轻量 Stream 喂给 handle_cmd
+class ByteStream : public Stream {
+  public:
+    const uint8_t *p; size_t n, i;
+    ByteStream(const uint8_t *_p, size_t _n) : p(_p), n(_n), i(0) {}
+    int available()                       override { return (int)(n - i); }
+    int read()                            override { return i < n ? (unsigned char)p[i++] : -1; }
+    int peek()                            override { return i < n ? (unsigned char)p[i] : -1; }
+    size_t write(uint8_t)                 override { return 0; }
+    size_t write(const uint8_t *, size_t) override { return 0; }
+    void flush()                          override {}
+};
 
 // ---- 双任务：跨任务共享句柄与握手标志 ----
 struct TxFrame {
@@ -424,11 +454,11 @@ void sender_task(void *arg) {
     g_inflight++;
 
     if (xSemaphoreTake(g_cli_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+      memset(&shim, 0, sizeof(shim));
+      shim.buf = t.buf; shim.len = t.len;
+      shim.width = t.w; shim.height = t.h; shim.format = (pixformat_t)t.fmt;
       if (cam_client && cam_client.connected()) {
         dst = cam_client.remoteIP();
-        memset(&shim, 0, sizeof(shim));
-        shim.buf = t.buf; shim.len = t.len;
-        shim.width = t.w; shim.height = t.h; shim.format = (pixformat_t)t.fmt;
         bool ok;
         if (udp_mode) {
           if (g_udp_backoff_frames > 0) {
@@ -445,6 +475,10 @@ void sender_task(void *arg) {
           }
         }
         if (ok) record_sent(t.len);
+      } else if (g_relay_viewer) {
+        // 无本地客户端但有观众经中继在观看 -> 整帧(含 FRAME 头)上行到中继
+        if (send_frame_relay(&shim)) record_sent(t.len);
+        else g_diag_skip_frames++;
       } else {
         g_diag_nc_frames++;
       }
@@ -506,6 +540,9 @@ void setup() {
   // 核0 与 lwIP/WiFi 任务共核但优先级低本任务; 发送是大块 memcpy+socket 写,
   // 放核0 让它和采集(DMA中断)抢的同时彻底不碰 loopTask(核1) 的控制响应。
   xTaskCreatePinnedToCore(sender_task, "tx", 4096, NULL, 3, NULL, 0);
+  g_relay_tx = xSemaphoreCreateMutex();
+  xTaskCreate(disc_task,  "disc",  2048, NULL, 1, NULL);   // 局域网自动发现广播
+  xTaskCreate(relay_task, "relay", 3072, NULL, 1, NULL);   // 跨网中继客户端(常驻在线)
   g_diag_last_ms = millis();
   g_adapt_last_ms = millis();
 #endif
@@ -525,13 +562,21 @@ void handle_web_root() {
     "<table>")
     + "<tr><td>热点</td><td>" + String(AP_SSID) + " (192.168.4.1)</td></tr>"
     + "<tr><td>STA 状态</td><td>" + String(WiFi.status() == WL_CONNECTED ? "已连接" : "未连接")
-    + " / " + String(g_sta_ssid) + "</td></tr></table>"
+    + " / " + String(g_sta_ssid) + "</td></tr>"
+    + "<tr><td>设备ID</td><td>" + String(g_dev_id) + "</td></tr>"
+    + "<tr><td>中继</td><td>" + String(g_relay_host[0] ? String(g_relay_host) : String("未配置"))
+    + (g_relay_online ? " <b>(在线)</b>" : "") + "</td></tr></table>"
     + "<hr><h3>设置摄像头要连接的目标 WiFi</h3>"
     + "<form action='/save' method='get'>"
     + "<label>WiFi 名称 (SSID)</label>"
     + "<input name='ssid' value='" + String(g_sta_ssid) + "'>"
     + "<label>密码</label>"
     + "<input type='password' name='pass' value='" + String(g_sta_pass) + "'>"
+    + "<hr><h3>入网标识 / 跨网中继(可选)</h3>"
+    + "<label>设备ID (局域网发现与中继注册用, 留空自动)</label>"
+    + "<input name='id' value='" + String(g_dev_id) + "'>"
+    + "<label>中继服务端 IP:端口 (如 1.2.3.4:8000, 留空=仅局域网)</label>"
+    + "<input name='relay' value='" + String(g_relay_host) + "'>"
     + "<button type='submit'>保存并连接</button></form>"
     + "<p style='color:#888'>保存后摄像头将尝试连接该 WiFi。连接成功后既可通过本热点(192.168.4.1)，"
     + "也可通过目标网络的局域网 IP 访问摄像头。</p></body></html>";
@@ -541,19 +586,28 @@ void handle_web_root() {
 void handle_web_save() {
   String _ssid = httpServer.hasArg("ssid") ? httpServer.arg("ssid") : "";
   String _pass = httpServer.hasArg("pass") ? httpServer.arg("pass") : "";
+  String _name = httpServer.hasArg("id")   ? httpServer.arg("id")   : "";
+  String _relay= httpServer.hasArg("relay")? httpServer.arg("relay"): "";
   _ssid.trim();
   if (_ssid.isEmpty()) {
     httpServer.send(200, "text/html; charset=utf-8",
         "<html><meta charset='utf-8'><body>SSID 不能为空，<a href='/'>返回</a></body></html>");
     return;
   }
+  if (_name.isEmpty()) _name = default_dev_id();
+  _relay.trim();
   g_prefs.begin("wifi", false);
   g_prefs.putString("ssid", _ssid);
   g_prefs.putString("pass", _pass);
+  g_prefs.putString("id",   _name);
+  g_prefs.putString("relay", _relay);
   g_prefs.end();
 
   _ssid.toCharArray(g_sta_ssid, sizeof(g_sta_ssid));
   _pass.toCharArray(g_sta_pass, sizeof(g_sta_pass));
+  _name.toCharArray(g_dev_id,   sizeof(g_dev_id));
+  if (_name != String(g_dev_name)) _name.toCharArray(g_dev_name, sizeof(g_dev_name));
+  _relay.toCharArray(g_relay_host, sizeof(g_relay_host));
 
   httpServer.send(200, "text/html; charset=utf-8",
       String("<html><meta charset='utf-8'><meta http-equiv='refresh' content='2;url=/'>"
@@ -563,6 +617,141 @@ void handle_web_save() {
   WiFi.disconnect();
   delay(50);
   WiFi.begin(g_sta_ssid, g_sta_pass);
+}
+
+// 默认设备注册 id: cam-<MAC 尾 4 字节>
+String default_dev_id() {
+  uint8_t m[6]; WiFi.macAddress(m);
+  char b[32];
+  snprintf(b, sizeof(b), "cam-%02X%02X%02X%02X", m[2], m[3], m[4], m[5]);
+  return String(b);
+}
+
+// 局域网自动发现: 周期 UDP 广播(255.255.255.255:9999)设备名 + STA IP。
+// 上位机 --auto 监听同端口即可自动发现并直连, 无需手动填 IP。
+void disc_announce() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  IPAddress ip = WiFi.localIP();
+  char msg[128];
+  snprintf(msg, sizeof(msg), "OV2640|%s|%d.%d.%d.%d",
+           g_dev_name, ip[0], ip[1], ip[2], ip[3]);
+  disc_udp.beginPacket(IPAddress(255, 255, 255, 255), DISCOVERY_PORT);
+  disc_udp.write((const uint8_t*)msg, strlen(msg));
+  disc_udp.endPacket();
+}
+void disc_task(void *arg) {
+  for (;;) {
+    if (WiFi.status() == WL_CONNECTED) disc_announce();
+    delay(3000);
+  }
+}
+
+// 中继: 发送一条"4字节大端长度+payload"消息; 加锁, 防止与帧上行交错。
+void relay_send_payload(const uint8_t *data, size_t len) {
+  if (!relay_cli || !relay_cli.connected()) return;
+  xSemaphoreTake(g_relay_tx, portMAX_DELAY);
+  uint8_t hdr[4] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16),
+                     (uint8_t)(len >> 8),  (uint8_t)len };
+  relay_cli.write(hdr, 4);
+  size_t off = 0;
+  while (off < len) {
+    size_t s = relay_cli.write(data + off, len - off);
+    if (s == 0) break;
+    off += s;
+    if (off < len) delay(1);
+  }
+  xSemaphoreGive(g_relay_tx);
+}
+
+// 中继: 读一条完整消息; 返回 false 表示断连/出错。
+bool relay_read_msg() {
+  relay_cli.setTimeout(1500);
+  uint8_t hdr[4];
+  if (relay_cli.readBytes(hdr, 4) != 4) return false;
+  uint32_t len = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16)
+               | ((uint32_t)hdr[2] << 8) | hdr[3];
+  if (len == 0 || len > (1 << 20)) return false;      // 非法长度防御
+  uint8_t *buf = (uint8_t*)malloc(len);
+  if (!buf) return false;
+  bool ok = (relay_cli.readBytes(buf, len) == (int)len);
+  if (ok && buf[0] == '{' && memchr(buf, '}', len)) {
+    char s[160]; int cn = len; if (cn > 159) cn = 159;
+    memcpy(s, buf, cn); s[cn] = 0;
+    if      (strstr(s, "viewer_attached")) g_relay_viewer = true;
+    else if (strstr(s, "viewer_left"))     g_relay_viewer = false;
+    // 其余 JSON(reg_ok/error)忽略
+  } else if (ok && buf[0] != '{') {
+    // 非 JSON = 观众下行命令, 作为字节流喂给命令处理器
+    ByteStream bs(buf, len);
+    while (bs.available() > 0) {
+      int c = bs.read();
+      if (c >= 0) handle_cmd(c, bs);
+    }
+  }
+  free(buf);
+  return ok;
+}
+
+// 中继客户端常驻任务: 连接服务端 -> 注册 -> 心跳保活 -> 观众接入/断开的控制消息。
+void relay_task(void *arg) {
+  uint32_t last_hb = 0;
+  for (;;) {
+    if (g_relay_host[0] == 0) { delay(5000); continue; }   // 未配置中继
+    char h[64] = {0}; int port = 8000;
+    sscanf(g_relay_host, "%63[^:]:%d", h, &port);
+    Dbg.printf("[中继] 连接 %s:%d ...\n", h, port);
+    if (relay_cli.connect(h, port, 5000)) {
+      relay_cli.setNoDelay(true);
+      g_relay_online = true;
+      last_hb = millis();
+      char reg[160];
+      snprintf(reg, sizeof(reg), "{\"t\":\"reg\",\"id\":\"%s\",\"name\":\"%s\"}",
+               g_dev_id, g_dev_name);
+      relay_send_payload((const uint8_t*)reg, strlen(reg));
+      Dbg.printf("[中继] 已注册 id=%s\n", g_dev_id);
+      bool conn = true;
+      while (conn) {
+        if (relay_cli.available()) {
+          if (!relay_read_msg()) conn = false;
+        } else {
+          uint32_t now = millis();
+          if (now - last_hb >= 20000) {              // 心跳保活/感知链路
+            relay_send_payload((const uint8_t*)"{\"t\":\"hb\"}", 10);
+            last_hb = now;
+          }
+          if (!relay_cli.connected()) conn = false;
+          if (conn) delay(10);
+        }
+      }
+      g_relay_online = false;
+      g_relay_viewer = false;
+      Dbg.println("[中继] 连接断开");
+      relay_cli.stop();
+    } else {
+      Dbg.println("[中继] 连接失败");
+    }
+    delay(4000);   // 重连退避
+  }
+}
+
+// 中继上行一帧: 把 FRAME_BEGIN/SIZE/数据/FRAME_END 打包成一条长度前缀消息。
+// 观众端拿到的是与局域网流一致的字节流, 复用上位机现有帧解析。
+bool send_frame_relay(camera_fb_t *fb) {
+  if (!g_relay_viewer || !relay_cli || !relay_cli.connected()) return false;
+  char head[64];
+  int hn = snprintf(head, sizeof(head), "FRAME_BEGIN\nSIZE %u %u %s\n",
+                    fb->width, fb->height,
+                    (fb->format == PIXFORMAT_JPEG) ? "JPG" : "RGB");
+  size_t endn = sizeof(FRAME_END) - 1;
+  size_t total = hn + fb->len + endn;
+  uint8_t *blob = (uint8_t*)heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!blob) return false;
+  memcpy(blob, head, hn);
+  memcpy(blob + hn, fb->buf, fb->len);
+  memcpy(blob + hn + fb->len, FRAME_END, endn);
+  relay_send_payload(blob, total);
+  heap_caps_free(blob);
+  return true;
 }
 
 void setup_wifi() {
@@ -576,9 +765,16 @@ void setup_wifi() {
   g_prefs.begin("wifi", true);
   String _ssid = g_prefs.getString("ssid", String(STA_SSID));
   String _pass = g_prefs.getString("pass", String(STA_PASS));
+  String _name = g_prefs.getString("name", String(AP_SSID));
+  String _id   = g_prefs.getString("id",   default_dev_id());
+  String _relay= g_prefs.getString("relay", "");      // "host:port", 空=关闭中继
   g_prefs.end();
   _ssid.toCharArray(g_sta_ssid, sizeof(g_sta_ssid));
   _pass.toCharArray(g_sta_pass, sizeof(g_sta_pass));
+  _name.toCharArray(g_dev_name, sizeof(g_dev_name));
+  _id.toCharArray(g_dev_id,   sizeof(g_dev_id));
+  _relay.toCharArray(g_relay_host, sizeof(g_relay_host));
+  if (g_relay_host[0] != 0) Dbg.printf("[中继] 目标: %s (id=%s)\n", g_relay_host, g_dev_id);
 
   cam_server.begin();
   cam_udp.begin(TCP_PORT);
