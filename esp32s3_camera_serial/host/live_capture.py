@@ -10,17 +10,35 @@ OV2640 实时预览 + 动态分辨率切换 + 拍照。
 快捷键: Ctrl+Q 退出
 """
 import sys, time, threading, queue, os, re, socket, io, json
+from select import select
 import serial
 from PIL import Image, ImageTk
 import tkinter as tk
+try:
+    import numpy as _np
+except ImportError:
+    _np = None
 
 # ---- 传输通道选择 ----
 #   串口:   python live_capture.py COM7 [baud]
 #   WiFi:   python live_capture.py --wifi [host] [port]   (host 默认 192.168.4.1)
 #   自动:   python live_capture.py --auto                 (UDP广播发现后直连局域网摄像头)
-#   中继:   python live_capture.py --relay 中继服务器:端口 [--id 设备ID]
-_FLAGS = ("--wifi", "--auto", "--relay", "--id", "--p2p")
+#   中继:   python live_capture.py --relay 中继服务器:端口 [--id 设备ID] [--token 口令]
+#           (服务器若启用了 token 鉴权, 必须带 --token)
+_FLAGS = ("--wifi", "--auto", "--relay", "--id", "--p2p", "--token")
 _P2P = "--p2p" in sys.argv   # 默认纯 TCP 中继(可靠); 加 --p2p 才启用打洞/TURN(跨网直连提速, 不稳定)
+
+
+def _flag_value(name):
+    """取 --name value 形式的可选参数值; 不存在返回 None。"""
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
+_TOKEN = _flag_value("--token")   # 中继鉴权口令, 与服务器启动参数一致
 if "--relay" in sys.argv:
     MODE = "relay"
 elif "--auto" in sys.argv:
@@ -36,7 +54,9 @@ if "--id" in sys.argv:
     if i + 1 < len(sys.argv):
         _auto_id = sys.argv[i + 1]
 
-_pos = [x for x in sys.argv[1:] if x not in _FLAGS and x != _auto_id]
+# 位置参数 = 既不是开关名、也不是开关取值的那些 argv(如中继地址 "host:port")
+_flag_values = {_auto_id, _TOKEN}
+_pos = [x for x in sys.argv[1:] if x not in _FLAGS and x not in _flag_values]
 
 DISCOVERY_PORT = 9999
 if MODE == "wifi":
@@ -65,8 +85,13 @@ RES = {
     "x": ("XGA", 1024, 768),
     "u": ("UXGA", 1600, 1200),
 }
-PREVIEW_CHOICES = ["QQVGA", "QVGA", "VGA"]      # 预览可选
-PHOTO_CHOICES = ["VGA", "SVGA", "XGA", "UXGA"]  # 拍照可选
+def res_label(code):
+    """分辨率下拉显示名: 名字带像素尺寸, 如 'UXGA 1600x1200'。"""
+    name, w, h = RES[code]
+    return f"{name} {w}x{h}"
+
+PREVIEW_CHOICES = [res_label(c) for c in "qtvsxu"]  # 预览可选(全档放开)
+PHOTO_CHOICES = [res_label(c) for c in "vsxu"]      # 拍照可选
 out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photos")
 
 # 预览当前尺寸(线程共享, 用锁保护)；photo_cfg 记录当前选中的拍照分辨率
@@ -83,6 +108,19 @@ stop = threading.Event()
 
 
 def convert_rgb(frame):
+    """big-endian RGB565 -> RGB888。
+
+    numpy 向量化优先(VGA 640x480 约 2ms); 无 numpy 时回退纯 Python 逐像素
+    (同一帧数百 ms, 会拖垮帧率, 建议 pip install numpy)。
+    """
+    if _np is not None:
+        a = _np.frombuffer(frame, dtype=">u2")     # 大端 uint16
+        flat = _np.empty((a.size, 3), dtype=_np.uint8)
+        # 舍入公式必须与纯 Python 分支一致((v*255+15)//31), 否则结果差 1
+        flat[:, 0] = (((a >> 11) & 0x1F) * 255 + 15) // 31
+        flat[:, 1] = (((a >> 5) & 0x3F) * 255 + 31) // 63
+        flat[:, 2] = ((a & 0x1F) * 255 + 15) // 31
+        return flat.tobytes()
     n = len(frame) // 2
     rgb = bytearray(n * 3)
     j = 0
@@ -96,7 +134,39 @@ def convert_rgb(frame):
     return bytes(rgb)
 
 
-_FRAME_RE = re.compile(rb'FRAME_BEGIN\nSIZE (\d+) (\d+) (\w+)\n(.*?)FRAME_END\n', re.S)
+_BEGIN = b"FRAME_BEGIN\n"
+_END = b"FRAME_END\n"
+
+
+def _split_frames(s):
+    """从累积缓冲切出所有完整帧单元。
+
+    返回 ([(w, h, fmt, body), ...], 已消费字节数)。
+    此前用 re.S + .*? 在累积缓冲上反复回溯匹配, 高分辨率下正则开销显著;
+    改为 find() 定位定界符 + 切片(与 udp_capture._pump_bytes 一致), 一次线性扫描。
+    """
+    out = []
+    pos = 0
+    while True:
+        i = s.find(_BEGIN, pos)
+        if i < 0:
+            # 只保留可能被截断在缓冲尾部的半个 _BEGIN
+            return out, max(0, len(s) - len(_BEGIN) + 1)
+        nl = s.find(b"\n", i + len(_BEGIN))
+        if nl < 0:
+            return out, i
+        e = s.find(_END, nl + 1)
+        if e < 0:
+            return out, i
+        parts = s[i + len(_BEGIN):nl].split()
+        if len(parts) >= 3 and parts[0] == b"SIZE":
+            try:
+                out.append((int(parts[1]), int(parts[2]),
+                            parts[3].decode("ascii", "ignore"), s[nl + 1:e]))
+            except ValueError:
+                pass
+        pos = e + len(_END)
+    return out, pos
 
 
 def discover_cameras(timeout=4.0):
@@ -142,13 +212,19 @@ class RelayIo:
         self._buf_lock = threading.Lock()   # 保护 self.buf (中继线程 + P2P 线程共用)
         # P2P 直连状态(尽力而为, 失败回退中继)
         self.cam_id = None
-        self._p2p_sock = None
+        # ---- 可靠 P2P 状态 ----
+        self._p2p_socks = []          # 本端候选 socket 列表(多端口, 交叉打洞用)
+        self._p2p_cands = []          # 对端(摄像头)候选 "ip:port" 列表
         self._p2p_thread = None
         self._p2p_stop = threading.Event()
         self._p2p_active = False
         self._p2p_last_rx = 0.0
-        self._p2p_peer = None
         self._p2p_start = 0.0
+        self._p2p_retry_at = 0.0      # 降级后下次请求重新撮合的时刻
+        self._p2p_last_done = None    # 最近一帧完成重组的 seq(丢帧统计基准)
+        self._p2p_stat_t = 0.0        # 质量统计窗口起点
+        self._p2p_ok = 0              # 窗口内完整帧数
+        self._p2p_lost = 0            # 窗口内按 seq 缺口估算的丢帧数
         self._p2p_ctx = {"seq": None, "cnt": 0, "w": 0, "h": 0, "fmt": 0,
                          "parts": None, "got": 0}
         devs = self._handshake(dev_id)
@@ -184,35 +260,48 @@ class RelayIo:
             target = devs[0]
             print(f"中继在线: {[(d['id'], d.get('name')) for d in devs]}", flush=True)
             print(f"未指定 --id, 自动选择第一个: {target['id']}", flush=True)
-        # 默认不做打洞: 只走可靠的 TCP 中继。只有 --p2p 时才上报 UDP 端点/打洞。
+        # 默认不做打洞: 只走可靠的 TCP 中继。只有 --p2p 时才上报 UDP 候选/打洞。
         if _P2P:
-            self._open_p2p_sock()
+            self._open_p2p_socks()
             self._send_stun(target["id"])
-        self._send_json({"t": "watch", "id": target["id"]})
+        watch = {"t": "watch", "id": target["id"]}
+        if _TOKEN:
+            watch["token"] = _TOKEN      # 服务器启用鉴权时必带
+        self._send_json(watch)
         r = json.loads(self._recv_exact(int.from_bytes(self._recv_exact(4), "big")))
         if r.get("t") != "watch_ok":
-            raise RuntimeError("观看请求失败: " + r.get("msg", ""))
+            msg = r.get("msg", "")
+            if msg == "unauthorized":
+                raise RuntimeError("鉴权失败: 服务器要求 token, 请用 --token <口令> 指定")
+            raise RuntimeError("观看请求失败: " + msg)
         return target
 
-    def _open_p2p_sock(self):
-        """创建 P2P UDP 套接字(绑定随机端口), 供 STUN 上报与后续打洞收流共用。"""
-        if self._p2p_sock is not None:
+    def _open_p2p_socks(self):
+        """创建 P2P 候选 UDP 套接字(多端口)。
+
+        可靠 P2P 关键点: 单候选时对端回包源端口稍有偏差(端口受限/对称 NAT)
+        即打不通; 多端口全部 STUN 上报后与对端候选交叉探测, 成倍提高命中率。
+        """
+        if self._p2p_socks:
             return
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0.05)
-            s.bind(("0.0.0.0", 0))
-            self._p2p_sock = s
-        except OSError as e:
-            print("P2P UDP 初始化失败:", e, flush=True)
+        for _ in range(3):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(0.05)
+                s.bind(("0.0.0.0", 0))
+                self._p2p_socks.append(s)
+            except OSError as e:
+                print("P2P UDP 初始化失败:", e, flush=True)
+                break
 
     def _send_stun(self, cam_id):
-        """用 P2P 套接字向服务器 UDP 端口上报自身公网端点(打洞辅助)。"""
-        if self._p2p_sock is None:
+        """全部候选套接字各向服务器 UDP 端口上报一次(每个端口一个反射候选)。"""
+        if not self._p2p_socks:
             return
         try:
             stun = json.dumps({"t": "stun", "id": cam_id, "role": "viewer"}).encode()
-            self._p2p_sock.sendto(stun, (self._relay_host, self._relay_udp_port))
+            for s in self._p2p_socks:
+                s.sendto(stun, (self._relay_host, self._relay_udp_port))
         except Exception:
             pass
     def _read_one(self):
@@ -248,13 +337,21 @@ class RelayIo:
             if have >= n:
                 break
             if self._p2p_active:
-                # P2P 直连已建立: 优先消费 UDP 重组帧; 长时间无 UDP 则回退中继
-                if self._p2p_last_rx and (time.time() - self._p2p_last_rx) > 3.0:
-                    print("P2P 链路超时, 回退中继", flush=True)
-                    self._stop_p2p()
+                # P2P/TURN 收流中: 优先消费 UDP 重组帧; 收流线程会在
+                # 失活/高丢片时自行降级(_degrade_p2p), 这里只等它退出。
+                if not self._p2p_socks:
                     continue
                 time.sleep(0.002)
                 continue
+            if _P2P and self._p2p_retry_at and time.time() >= self._p2p_retry_at:
+                # 降级后的周期恢复: 请求服务器重新撮合(重发双方最新候选再打洞)。
+                # 网络状况会变(NAT 映射刷新/观众换网), 不应一次失败就永久放弃。
+                self._p2p_retry_at = 0.0
+                try:
+                    self._send_json({"t": "p2p_refresh"})
+                    print("请求重新撮合 P2P...", flush=True)
+                except Exception:
+                    pass
             msg = self._read_one()
             if msg is None:
                 break
@@ -271,76 +368,143 @@ class RelayIo:
         return out
 
     def _handle_json(self, msg):
-        """处理中继下发的 JSON 信令; 目前只关心 p2p_peer(打洞直连)。"""
+        """处理中继下发的 JSON 信令; 关心 p2p_peer(打洞直连)与重撮合。"""
         try:
             o = json.loads(msg.decode("utf-8", "ignore"))
         except Exception:
             return
         if o.get("t") == "p2p_peer" and _P2P:
-            ip = o.get("ip")
-            port = o.get("port")
-            if ip and port:
-                self._start_p2p(ip, int(port))
+            # 可靠 P2P: 优先取 cands 全部候选("ip:port" 列表)交叉打洞;
+            # 旧服务器只有单 ip/port, 回退兼容。
+            cands = o.get("cands") or []
+            if not cands and o.get("ip") and o.get("port"):
+                cands = [f"{o['ip']}:{o['port']}"]
+            if cands:
+                self._start_p2p(cands)
 
-    def _start_p2p(self, ip, port):
-        """开启 P2P: 复用握手时建的 UDP 套接字, 向对端打洞 + 后台收流重组。"""
-        if self._p2p_sock is None:
-            self._open_p2p_sock()
-        if self._p2p_sock is None:
+    def _start_p2p(self, cands):
+        """开启 P2P: 全部候选 socket x 对端全部候选交叉打洞 + select 收流重组。"""
+        self._open_p2p_socks()
+        if not self._p2p_socks:
+            return
+        if self._p2p_thread and self._p2p_thread.is_alive():
+            self._p2p_cands = list(cands)     # 线程在跑, 仅更新候选表(重撮合场景)
             return
         self._p2p_stop.clear()
-        self._p2p_peer = (ip, port)
+        self._p2p_cands = list(cands)
         self._p2p_start = time.time()
-        # 打洞: 持续向对端公网端点发包, 让双方 NAT 建立映射
+        self._p2p_last_rx = time.time()
+        self._p2p_stat_t = self._p2p_start
+        self._p2p_ok = self._p2p_lost = 0
         self._p2p_thread = threading.Thread(target=self._p2p_loop, daemon=True)
         self._p2p_thread.start()
-        print(f"P2P 打洞中 -> {ip}:{port}", flush=True)
+        print(f"P2P 交叉打洞中: {len(self._p2p_socks)}x{len(cands)} 组合 -> {cands}", flush=True)
+
+    def _degrade_p2p(self, reason):
+        """P2P 降级: 停收流回退中继, 并安排 30s 后请求重新撮合(网络会恢复)。"""
+        if not self._p2p_active and not self._p2p_socks:
+            return
+        print(f"P2P 降级({reason}), 回退中继, 30s 后重试", flush=True)
+        self._p2p_active = False
+        self._p2p_retry_at = time.time() + 30.0
+        self._p2p_stop.set()
+        for s in self._p2p_socks:
+            try:
+                s.close()
+            except Exception:
+                pass
+        self._p2p_socks = []
+        self._p2p_last_rx = 0.0
 
     def _p2p_loop(self):
-        """后台线程: 向对端打洞 + 收 UDP 数据报重组为 FRAME 文本流喂给 self.buf。"""
-        s = self._p2p_sock
-        peer = self._p2p_peer
-        punch = json.dumps({"t": "punch"}).encode()
+        """后台线程: 交叉打洞/双向保活 + select 多路收流 + 质量探测自动降级。"""
+        punch = b"P2P"                      # 与固件约定同 magic
         last_punch = 0.0
         last_stun = 0.0
         while not self._p2p_stop.is_set():
             now = time.time()
-            # 打洞包: 前 2s 每 100ms 一发, 之后每 500ms 保活
-            if now - last_punch >= (0.1 if now - self._p2p_start < 2.0 else 0.5):
-                try:
-                    s.sendto(punch, peer)
-                except OSError:
-                    pass
+            peers = [self._cand_ep(c) for c in self._p2p_cands]
+            # 打洞包: 前 2s 每 100ms 一发(覆盖全部本端x对端组合), 之后 500ms 保活。
+            # 保活是双向的: 本端持续发维持本端 NAT 映射, 摄像头侧同理。
+            if peers and now - last_punch >= (0.1 if now - self._p2p_start < 2.0 else 0.5):
+                for s in self._p2p_socks:
+                    for ep in peers:
+                        try:
+                            s.sendto(punch, ep)
+                        except OSError:
+                            pass
                 last_punch = now
-            # STUN 周期保活: 维持服务器上本端(viewer)的反射端点。
-            # 摄像头打洞失败切 TURN 后, 帧由服务器转向本端点; 端点过期则收不到。
+            # STUN 周期保活: 维持服务器上本端全部候选的反射端点。
+            # 摄像头走 TURN 时帧由服务器转向这些端点; 端点过期则收不到。
             if now - last_stun >= 10.0:
                 self._send_stun(self.cam_id)
                 last_stun = now
-            try:
-                pkt, _ = s.recvfrom(2048)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if len(pkt) < 12 or pkt[:3] != b"OVU":
-                continue   # 非视频数据报(如对端打洞回包), 忽略
-            self._p2p_last_rx = time.time()
-            self._feed_udp_frame(pkt)
+            # 多路收流: 任一 socket 收到 OVU 都重组(TURN 冗余转发按 seq 去重)
+            r, _, _ = select(self._p2p_socks, [], [], 0.05)
+            got = False
+            for s in r:
+                try:
+                    pkt, _ = s.recvfrom(2048)
+                except OSError:
+                    continue
+                got = True
+                if len(pkt) >= 3 and pkt[:3] == b"P2P":
+                    continue                # 对端打洞/保活包: 活性由 got 体现
+                if len(pkt) < 12 or pkt[:3] != b"OVU":
+                    continue
+                self._p2p_last_rx = time.time()
+                self._feed_udp_frame(pkt)
+            if got:
+                self._p2p_last_rx = time.time()
+            else:
+                # 活性判定: 已建立直连后 3s 无任何对端包 -> 链路死亡
+                if self._p2p_active and self._p2p_last_rx \
+                        and now - self._p2p_last_rx > 3.0:
+                    self._degrade_p2p("3s 无对端数据")
+                    return
+            # 质量探测: 每 5s 结算丢帧率, 持续高丢片(链路半死)也降级回中继
+            if now - self._p2p_stat_t >= 5.0:
+                total = self._p2p_ok + self._p2p_lost
+                if total >= 20 and self._p2p_lost / total > 0.4:
+                    self._degrade_p2p(
+                        f"丢帧率 {self._p2p_lost * 100 // max(total, 1)}% 过高")
+                    return
+                self._p2p_stat_t = now
+                self._p2p_ok = self._p2p_lost = 0
         self._p2p_active = False
 
+    @staticmethod
+    def _cand_ep(c):
+        """'ip:port' -> (ip, port)；非法返回 None。"""
+        try:
+            ip, _, port = c.rpartition(":")
+            return (ip, int(port))
+        except Exception:
+            return None
+
     def _feed_udp_frame(self, pkt):
-        """把 12 字节头 + 分片重组为完整帧, 转成 FRAME 文本流追加到 self.buf。"""
+        """把 12 字节头 + 分片重组为完整帧, 转成 FRAME 文本流追加到 self.buf。
+
+        冗余去重: TURN 会对全部候选端点转发, 同一片可能从多个 socket 到达;
+        已完成帧的副本直接丢弃, 重组内按 idx 去重。"""
         seq = (pkt[4] << 8) | pkt[5]
         cnt = pkt[6] + 1
         idx = pkt[7]
         w = (pkt[8] << 8) | pkt[9]
         h = (pkt[10] << 8) | pkt[11]
         fmt = pkt[3]
+        if seq == self._p2p_last_done:      # 已完成帧的冗余副本
+            return
         ctx = self._p2p_ctx
         if ctx["seq"] != seq:
-            ctx.update(seq=seq, cnt=cnt, w=w, h=h, fmt=fmt,
-                       parts=[None] * cnt, got=0)
+            # 新帧: 以"最近完成帧"为基准统计缺口(TURN 冗余不会虚增丢帧)
+            if self._p2p_last_done is not None:
+                gap = (seq - self._p2p_last_done - 1) & 0xFFFF
+                if 0 < gap < 4096:
+                    self._p2p_lost += gap
+            ctx = {"seq": seq, "cnt": cnt, "w": w, "h": h, "fmt": fmt,
+                   "parts": [None] * cnt, "got": 0}
+            self._p2p_ctx = ctx
         if idx >= ctx["cnt"] or ctx["parts"][idx] is not None:
             return
         ctx["parts"][idx] = pkt[12:]
@@ -349,7 +513,10 @@ class RelayIo:
             return
         frame = b"".join(ctx["parts"])
         fw, fh, ffmt = ctx["w"], ctx["h"], ctx["fmt"]
-        ctx.update(seq=None, cnt=0, w=0, h=0, fmt=0, parts=None, got=0)
+        self._p2p_last_done = seq
+        self._p2p_ok += 1
+        self._p2p_ctx = {"seq": None, "cnt": 0, "w": 0, "h": 0, "fmt": 0,
+                         "parts": None, "got": 0}
         if ffmt == 1:
             ok = len(frame) > 100 and frame[:2] == b"\xff\xd8" and frame[-2:] == b"\xff\xd9"
             fname = "JPG"
@@ -367,12 +534,12 @@ class RelayIo:
 
     def _stop_p2p(self):
         self._p2p_stop.set()
-        if self._p2p_sock is not None:
+        for s in self._p2p_socks:
             try:
-                self._p2p_sock.close()
+                s.close()
             except Exception:
                 pass
-            self._p2p_sock = None
+        self._p2p_socks = []
         self._p2p_active = False
         self._p2p_last_rx = 0.0
     def write(self, b):
@@ -565,21 +732,14 @@ def reader():
             continue
         buf += data
         s = bytes(buf)
-        if _FRAME_RE.search(s) is None:
+        frames, consumed = _split_frames(s)
+        if not frames:
             if len(buf) > 8 << 20:
                 del buf[: (4 << 20)]
             continue
         resync_pending = last_frame_time == 0.0
-        pos = 0
-        while True:
-            m = _FRAME_RE.search(s, pos)
-            if not m:
-                break
-            w, h = int(m.group(1)), int(m.group(2))
-            fmt = m.group(3).decode('ascii', 'ignore')      # JPG 或 RGB
-            body = m.group(4)
+        for w, h, fmt, body in frames:
             fb_len = w * h * 2
-            end = m.end()
             with state_lock:
                 pw, ph = preview["w"], preview["h"]
                 want_photo = photo_req.get("active")
@@ -611,8 +771,7 @@ def reader():
                         photo_req["active"] = False
                     print(f"收到照片帧 {w}x{h} {fmt}", flush=True)
                 last_frame_time = time.time()
-            pos = end
-        buf = bytearray(s[pos:])
+        buf = bytearray(s[consumed:])
         # 重连(或首次)拿到首帧后，把界面选择的分辨率重新下发给板子，避免错位
         if resync_pending:
             resync_board()
@@ -620,7 +779,7 @@ def reader():
 
 # ---- 命令：切换预览/拍照分辨率 ----
 def set_preview(name):
-    code = [c for c, r in RES.items() if r[0] == name]
+    code = [c for c, r in RES.items() if name.split()[0] == r[0]]  # 'UXGA 1600x1200' -> 'UXGA'
     if not code:
         return
     code = code[0]
@@ -638,7 +797,7 @@ def set_preview(name):
 
 
 def set_photo(name):
-    code = [c for c, r in RES.items() if r[0] == name]
+    code = [c for c, r in RES.items() if name.split()[0] == r[0]]
     if not code:
         return
     code = code[0]
@@ -679,7 +838,7 @@ def preview_h_for_photo():
 
 def cur_photo_size():
     name = photo_var.get()
-    code = [c for c, r in RES.items() if r[0] == name][0]
+    code = [c for c, r in RES.items() if name.split()[0] == r[0]][0]
     return RES[code][1], RES[code][2]
 
 
@@ -726,10 +885,10 @@ root.title(f"OV2640 实时预览+动态拍照 [{port}@{baud}]")
 
 top = tk.Frame(root); top.pack(fill="x", padx=6, pady=6)
 tk.Label(top, text="预览:").pack(side="left")
-preview_var = tk.StringVar(value="QVGA")
+preview_var = tk.StringVar(value=res_label("t"))
 tk.OptionMenu(top, preview_var, *PREVIEW_CHOICES, command=set_preview).pack(side="left", padx=3)
 tk.Label(top, text="拍照:").pack(side="left", padx=(12, 0))
-photo_var = tk.StringVar(value="UXGA")
+photo_var = tk.StringVar(value=res_label("u"))
 tk.OptionMenu(top, photo_var, *PHOTO_CHOICES, command=set_photo).pack(side="left", padx=3)
 btn = tk.Button(top, text="拍 照", command=do_photo,
                 bg="#2d8", activebackground="#1b6", font=("", 12, "bold"))

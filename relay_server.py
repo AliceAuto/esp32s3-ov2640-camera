@@ -33,18 +33,26 @@ OV2640 跨网信令 + 中继服务端。
   之后 CAM/VIEWER 之间发起的非 JSON 字节将双向透传(见上)。
   P2P 直连为"尽力而为": 打洞成功则视频改走 UDP 直连, 失败仍走本中继(TCP)。
 
-用法:  python relay_server.py [port]
-默认端口 8000。需在云服务器防火墙/安全组放行 TCP 8000。
+用法:  python relay_server.py [port] [token]
+默认端口 8000。需在云服务器防火墙/安全组放行 TCP 8000 (+UDP port+1)。
+可选 token: 设置后 reg/watch 都必须携带相同 token, 防止任何人列举 id 即可观看
+(此前的服务端完全无鉴权 —— 知道或猜到 cam id 就能看, 端口扫描器也能白嫖带宽)。
+也可用环境变量 RELAY_TOKEN 传入。留空 = 不鉴权(兼容旧客户端/内网自用)。
 """
-import sys, threading, time, json, socket, traceback, queue
+import sys, threading, time, json, socket, traceback, queue, os
 from collections import OrderedDict
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+TOKEN = (sys.argv[2] if len(sys.argv) > 2 else "") or os.environ.get("RELAY_TOKEN", "")
 
 # 每个连接的出站队列深度(单位: 条消息)。视频帧走 UDP 之外的 TCP 中继时,
 # 一条消息就是一整帧(可达数十 KB)。队列化后慢观众只积压自己的队列,
 # 不再把 sendall 的阻塞反压到摄像头的接收线程 -> 摄像头 TCP 窗口关窗 -> sender_task 停摆。
 VIDEO_QUEUE_MAX = 8
+
+# 可靠 P2P: 每端候选 socket 数上限。双方各开多个 UDP 端口并全部 STUN 上报,
+# 打洞时交叉探测 N x M 个组合 —— 单候选对端口受限/对称 NAT 基本打不通。
+P2P_MAX_CANDS = 4
 
 # ---------------------------------------------------------------------------
 # 连接对象: 持有 socket + 身份(device / viewer) + 转发对端
@@ -64,24 +72,64 @@ class Conn:
         # 使慢观众只影响自己, 不会把阻塞反压到摄像头
         self.out_q = queue.Queue(maxsize=VIDEO_QUEUE_MAX)
         self.out_alive = True
+        self._out_thread = None
         self.name = None              # 显示名(来自 reg 消息)
         self.since = 0                # 注册时间戳
         self.bytes_relayed = 0        # 累计转发字节数(监控用)
 
+    def _release(self):
+        """真正关闭 socket —— 只在出站队列排空后调用。
+
+        关闭时序很重要: 鉴权拒绝时若立即 shutdown, 待发的 unauthorized 提示
+        会随 socket 一起消失, 对端只看到一个无原因的断连, 排查困难。
+        """
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def close(self):
+        if not self.running:
+            return
+        self.running = False
+        self.out_alive = False
+        self.srv.detach(self)
+        # 注意: 不能用 t.is_alive() 判断! Thread.is_alive() 在线程真正开始执行前
+        # 返回 False(_started 事件由线程自身在 bootstrap 里设置)。鉴权拒绝这类
+        # "accept 后立刻回复并关闭"的路径会稳定命中该窗口 -> 直接关 socket,
+        # 待发的 unauthorized 提示随连接一起消失, 对端只看到无原因断连。
+        # 改成"线程对象是否已创建": 出站线程任何退出路径都会自行 _release()。
+        t = getattr(self, "_out_thread", None)
+        if t is not None:
+            try:
+                # 哨兵排在已有消息之后, FIFO 保证先发完提示再关闭
+                self.out_q.put_nowait(None)
+            except Exception:
+                self._release()
+        else:
+            self._release()          # 未启发送线程时直接关闭
+
     def start_out(self):
-        threading.Thread(target=self._out_loop, daemon=True).start()
+        self._out_thread = threading.Thread(target=self._out_loop, daemon=True)
+        self._out_thread.start()
 
     def _out_loop(self):
-        while self.out_alive:
+        while True:
             item = self.out_q.get()
-            if item is None:                      # 关闭哨兵
+            if item is None:                  # 关闭哨兵(队列已排空)
                 break
             try:
                 self.sock.sendall(len(item).to_bytes(4, "big") + item)
                 self.bytes_relayed += len(item) + 4
             except OSError:
-                self.close()
                 break
+            if not self.out_alive and self.out_q.empty():
+                break                         # 已请求关闭且队列空
+        self._release()
 
     def send_payload(self, payload: bytes):
         """入队一条待发消息, 不阻塞调用方(摄像头接收线程)。
@@ -110,29 +158,10 @@ class Conn:
     def send_json(self, obj):
         self.send_payload(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
-    def close(self):
-        if not self.running:
-            return
-        self.running = False
-        self.out_alive = False
-        try:
-            self.out_q.put_nowait(None)           # 唤醒发送线程退出
-        except Exception:
-            pass
-        self.srv.detach(self)
-        try:
-            self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-
-
 class Server:
-    def __init__(self, port):
+    def __init__(self, port, token=""):
         self.port = port
+        self.token = token             # 共享口令; 空 = 不鉴权
         self.devices = OrderedDict()   # id -> Conn
         self.lock = threading.Lock()
         # P2P 打洞辅助: UDP STUN 端口(默认 port+1), 记录各端 UDP 公网端点。
@@ -176,6 +205,14 @@ class Server:
 
     def handle_json(self, c: Conn, msg: dict):
         t = msg.get("t")
+        # 鉴权: reg/watch 必须携带与服务器一致的 token。
+        # 在处理任何业务前拒绝, 未授权的 reg 直接断连(防扫描器反复试探)。
+        if self.token and t in ("reg", "watch") and msg.get("token") != self.token:
+            self.log(f"拒绝未授权 {t} 来自 {c.addr}")
+            c.send_json({"t": "error", "msg": "unauthorized"})
+            if t == "reg":
+                c.close()
+            return
         if t == "reg":
             if c.is_camera:
                 return
@@ -200,6 +237,13 @@ class Server:
                          "online": bool(d.running),
                          "since": int(d.since or now)} for d in self.devices.values()]
             c.send_json({"t": "devices", "devices": devs})
+        elif t == "p2p_refresh":
+            # 观众 P2P 失败回退中继后, 周期性请求重新撮合: 网络状况会变
+            # (NAT 映射刷新/观众换网), 重新下发候选让双方再试一轮打洞。
+            if c.is_camera or c.peer is None:
+                return
+            cam = c.peer
+            self.match_p2p(cam.device_id, cam, c, why="refresh")
         elif t == "watch":
             if c.is_camera:
                 return
@@ -219,23 +263,39 @@ class Server:
             c.peer = cam
             cam.send_json({"t": "viewer_attached"})
             c.send_json({"t": "watch_ok"})
-            # P2P 撮合: 把对端 UDP 公网端点(STUN 上报)下发给双方, 供 UDP 打洞直连。
-            # 未上报则退回对端 TCP 公网端点(尽力而为)。打洞失败仍走本中继(TCP)。
-            with self.udp_lock:
-                cam_ep = self.udp_endpoints.get(f"cam:{target_id}") or (cam.addr[0], cam.addr[1])
-                view_ep = self.udp_endpoints.get(f"viewer:{target_id}") or (c.addr[0], c.addr[1])
-            cam.send_json({"t": "p2p_peer", "ip": view_ep[0], "port": view_ep[1]})
-            c.send_json({"t": "p2p_peer", "ip": cam_ep[0], "port": cam_ep[1]})
-            self.log(f"观众 {c.addr} 观看 {target_id} (p2p_peer 已下发)")
-            # 观众若已 STUN 上报(即服务器持有其 UDP 公网端点), 通知摄像头视频直接走
-            # TURN UDP, 不必先经过数秒 TCP 中继 —— TCP 中继是队头阻塞的, 跨网帧率
-            # 会被单帧 RTT 卡住。未上报端点的观众(如 deploy/relay_fps.py)收不到此
-            # 信令, 行为保持原样, 兼容旧的纯 TCP 中继用法。
-            with self.udp_lock:
-                have_viewer_ep = f"viewer:{target_id}" in self.udp_endpoints
-            if have_viewer_ep:
-                cam.send_json({"t": "viewer_udp"})
-                self.log(f"观众 {c.addr} 已 STUN, 通知 {target_id} 视频改走 TURN UDP")
+            self.match_p2p(target_id, cam, c, why="watch")
+
+    def match_p2p(self, target_id, cam, viewer, why=""):
+        """P2P 撮合: 把双方 UDP 候选端点列表交叉下发给对方, 供打洞直连。
+
+        可靠性设计:
+        - cands 为 "ip:port" 字符串列表(本端全部候选 socket 的反射端点);
+          同时保留 ip/port=主候选, 旧固件/旧观众仍可按单候选工作。
+        - 观众没有任何 UDP 候选时不下发 p2p_peer: 此前用 TCP 公网端点兜底,
+          但 TCP 端口与 UDP 映射无关, 打洞必失败还白耗 3s 打洞窗口。
+        - 摄像头收到 viewer_udp 信令后视频立即走 TURN(不等打洞结果)。
+        """
+        with self.udp_lock:
+            cam_cands = [f"{ip}:{port}" for ip, port in
+                         (self.udp_endpoints.get(f"cam:{target_id}") or [])]
+            view_cands = [f"{ip}:{port}" for ip, port in
+                          (self.udp_endpoints.get(f"viewer:{target_id}") or [])]
+        if not cam_cands and not view_cands:
+            self.log(f"撮合跳过({why}): 双方均无 UDP 候选")
+            return
+        if view_cands:
+            cam.send_json({"t": "p2p_peer", "ip": view_cands[0].split(":")[0],
+                           "port": int(view_cands[0].rsplit(":", 1)[1]),
+                           "cands": view_cands})
+        if cam_cands:
+            viewer.send_json({"t": "p2p_peer", "ip": cam_cands[0].split(":")[0],
+                              "port": int(cam_cands[0].rsplit(":", 1)[1]),
+                              "cands": cam_cands})
+        # 观众有 UDP 候选 -> 摄像头视频直接走 TURN UDP, 不必先经过数秒 TCP 中继。
+        # TCP 中继是队头阻塞的, 跨网帧率会被单帧 RTT 卡住。
+        if view_cands:
+            cam.send_json({"t": "viewer_udp"})
+        self.log(f"撮合({why}) cam_cands={len(cam_cands)} view_cands={len(view_cands)}")
 
     def _recv_exact(self, c: Conn, n: int):
         """读满 n 字节; 返回空 bytes 表示连接已关闭/出错。"""
@@ -304,8 +364,15 @@ class Server:
                     role = msg.get("role") or "cam"
                     key = f"cam:{cam_id}" if role == "cam" else f"viewer:{cam_id}"
                     with self.udp_lock:
-                        self.udp_endpoints[key] = (addr[0], addr[1])
-                    self.log(f"STUN {role} {cam_id}: {addr[0]}:{addr[1]}")
+                        # 可靠 P2P: 每端开多个候选 socket, 各自发一次 STUN。
+                        # 端点累积成列表(去重, 滚动保留最新 P2P_MAX_CANDS 个),
+                        # 打洞时交叉探测全部组合, 大幅提高受限/对称 NAT 的打通率。
+                        lst = self.udp_endpoints.setdefault(key, [])
+                        if (addr[0], addr[1]) not in lst:
+                            lst.append((addr[0], addr[1]))
+                        while len(lst) > P2P_MAX_CANDS:
+                            lst.pop(0)
+                    self.log(f"STUN {role} {cam_id}: {addr[0]}:{addr[1]} (cands={len(lst)})")
                     try:
                         s.sendto(json.dumps({"t": "stun_ok", "ip": addr[0],
                                              "port": addr[1]}).encode(), addr)
@@ -326,13 +393,16 @@ class Server:
                 payload = data[7 + nl:]
                 target_key = f"viewer:{cam_id}" if magic == b"C2V" else f"cam:{cam_id}"
                 with self.udp_lock:
-                    target = self.udp_endpoints.get(target_key)
-                if target:
-                    self.log(f"TURN {magic.decode()} cam={cam_id} -> {target} {len(payload)}B")
-                    try:
-                        s.sendto(payload, target)
-                    except OSError:
-                        pass
+                    targets = list(self.udp_endpoints.get(target_key) or [])
+                if targets:
+                    # 可靠 TURN: 向对端全部候选端点冗余转发。观众/摄像头多候选 socket
+                    # 都在收, 重组按 (seq,idx) 去重, 冗余包无害; 任一映射仍有效即可达。
+                    for t_ep in targets:
+                        try:
+                            s.sendto(payload, t_ep)
+                        except OSError:
+                            pass
+                    self.log(f"TURN {magic.decode()} cam={cam_id} -> x{len(targets)} {len(payload)}B")
                 else:
                     self.log(f"TURN 无对端端点 cam={cam_id} dir={magic.decode()}")
                 continue
@@ -387,4 +457,9 @@ class Server:
 
 
 if __name__ == "__main__":
-    Server(PORT).serve()
+    srv = Server(PORT, TOKEN)
+    if TOKEN:
+        srv.log("token 鉴权已启用 (reg/watch 需携带)")
+    else:
+        srv.log("警告: 未设置 token, 任何知道设备 id 的人都能观看")
+    srv.serve()

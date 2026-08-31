@@ -60,6 +60,8 @@ bool send_frame_udp_via_turn(camera_fb_t *fb);
 void p2p_punch();
 void ice_poll();
 void turn_keepalive();
+static void p2p_socks_init();
+static void p2p_reset();
 String default_dev_id();
 
 // UART0 = CH343 转串口所在通道（TX=GPIO43, RX=GPIO44），避免默认 Serial 走 USB-CDC。
@@ -129,26 +131,53 @@ static uint32_t    g_adapt_last_err     = 0;
 // ---- 局域网自动发现 + 跨网中继客户端 ----
 #define DISCOVERY_PORT  9999          // 局域网广播发现端口
 #define RELAY_HOST_DEFAULT "8.148.79.85:8001"   // 未配置时默认连接的公网中继服务端(空=关闭)
+#ifndef RELAY_TOKEN
+#define RELAY_TOKEN ""                          // 中继鉴权口令, secrets.h 可覆盖(与服务器一致)
+#endif
 static WiFiUDP      disc_udp;
 static uint32_t     g_disc_last_ms = 0;
 
 static char         g_dev_name[32]   = AP_SSID;  // 广播/注册用设备名(可在配网页改)
 static char         g_dev_id[40]     = "";       // 注册 id(默认 cam-<MAC后4字节>)
 static char         g_relay_host[80] = "";       // 中继服务端 "host:port", 空=关闭
+static char         g_relay_token[40]= "";       // 中继鉴权口令(reg/watch 必须携带)
 static WiFiClient   relay_cli;
 static SemaphoreHandle_t g_relay_tx  = NULL;     // 保护 relay 发送(信令与帧交错用)
 static volatile bool g_relay_viewer  = false;    // 有观众经中继在观看
 static volatile bool g_relay_online  = false;    // 已连上中继服务端
 
-// ---- P2P 直连(尽力而为, 失败回退中继) ----
-static IPAddress     g_p2p_peer_ip;              // P2P 对端(观众)公网 IP
-static volatile uint16_t g_p2p_peer_port = 0;    // P2P 对端公网端口(0=未配置)
+// ---- 可靠 P2P 直连: 多候选交叉打洞 + 双向保活 + 三层降级闭环 ----
+// 可靠性设计(对照旧版"单候选单端口, 3s 失败永久放弃"的缺陷):
+//   1. 本端 3 个候选 socket(主口 cam_udp + 2 个随机口)全部 STUN 上报, 对端同理;
+//      打洞交叉探测 3xN 组合 —— 端口受限/对称 NAT 下单候选几乎必败。
+//   2. 打洞/保活包带 magic, 回包校验 IP+端口都在候选表内才认定成功(防误判)。
+//   3. 直连后双向 500ms keepalive, 双向维持 NAT 映射(旧版只有观众单向发)。
+//   4. 降级链闭环: 直连失活->TURN; TURN 失活->TCP 中继; 期间周期重试打洞恢复直连。
+//      旧版 TURN 优先级高于 TCP 且失败不可检测, 观众退出后会一直往死端点发帧。
+#define P2P_NSOCK      3                  // 本端候选 socket 数([0]=cam_udp 主口)
+#define P2P_NPEER_MAX  4                  // 对端候选数上限(服务器下发 cands)
+#define P2P_MAGIC      "P2P"              // 打洞/保活包 magic(3B)
+#define P2P_PUNCH_MS   100                // 打洞发包周期
+#define P2P_PUNCH_TMO  3000               // 单轮打洞超时(超时切 TURN, 但保留候选重试)
+#define P2P_KEEPALIVE_MS 500              // 直连保活周期
+#define P2P_DEAD_MS    3000               // 直连失活判定(多久没收到对端包)
+#define P2P_TURN_DEAD_MS 5000             // TURN 失活判定(观众 socket 已关, 降 TCP)
+#define P2P_RETRY_MS   30000              // 走 TURN/TCP 期间重试打洞周期
+static WiFiUDP*      g_p2p_udp[P2P_NSOCK] = {NULL, NULL, NULL};  // [0]=&cam_udp
+static IPAddress     g_p2p_peer_ipN[P2P_NPEER_MAX];   // 对端候选表(打洞目标)
+static uint16_t      g_p2p_peer_portN[P2P_NPEER_MAX] = {0};
+static int           g_p2p_npeer = 0;            // 有效对端候选数
+static volatile int8_t g_p2p_lock_sock = -1;     // 打洞成功锁定的本端 socket 索引
+static IPAddress     g_p2p_lock_ip;              // 锁定的对端端点(视频发往此处)
+static uint16_t      g_p2p_lock_port = 0;
 static volatile bool g_p2p_active = false;       // P2P 直连已建立(视频走 UDP 直连)
-static uint32_t      g_p2p_punch_ms = 0;         // 上次打洞发包时间
-static uint32_t      g_p2p_punch_start = 0;      // 打洞开始时间(超时放弃用)
-static uint32_t      g_p2p_last_rx = 0;          // 最近收到对端包的时刻(直连存活判定)
-static volatile bool g_turn_mode    = false;     // 打洞超时已切换 TURN 兜底(帧经服务器转向观众)
+static uint32_t      g_p2p_punch_ms = 0;         // 上次打洞/保活发包时间
+static uint32_t      g_p2p_punch_start = 0;      // 本轮打洞开始时间
+static uint32_t      g_p2p_next_retry = 0;       // 下次重试打洞时刻(降级后周期恢复)
+static uint32_t      g_p2p_last_rx = 0;          // 最近收到对端包的时刻(存活判定)
+static volatile bool g_turn_mode    = false;     // TURN 兜底(帧经服务器转向观众)
 static uint32_t      g_turn_last_stun = 0;       // 上次 STUN 保活刷新时间
+static bool          g_p2p_socks_ready = false;  // 候选 socket 是否已创建
 
 // 中继链路收到的一整条命令数据; 用轻量 Stream 喂给 handle_cmd
 class ByteStream : public Stream {
@@ -374,7 +403,7 @@ static inline size_t ovu_chunk_count(size_t len) {
 //        生成链式 pbuf(两次分配+拷贝)，每帧 4~36 片 = 每帧数十次额外开销。
 // 优化2: 重试改为整帧共享预算。此前小帧 6 次重试×2ms×最多4片 = 最坏阻塞 48ms
 //        (注释写 8ms 与实际不符)，期间 sender_task 停止消费队列。
-static bool send_frame_udp_locked(camera_fb_t *fb, IPAddress dst, uint16_t port) {
+static bool send_frame_udp_locked(camera_fb_t *fb, WiFiUDP &u, IPAddress dst, uint16_t port) {
   const uint8_t *buf = fb->buf;
   size_t len = fb->len;
   size_t nchunk = ovu_chunk_count(len);
@@ -394,9 +423,9 @@ static bool send_frame_udp_locked(camera_fb_t *fb, IPAddress dst, uint16_t port)
     memcpy(pkt + OVU_HDR, buf + off, n);
     bool sent = false;
     for (int t = 0; t <= max_retry; t++) {
-      cam_udp.beginPacket(dst, port);
-      cam_udp.write(pkt, OVU_HDR + n);
-      int rc = cam_udp.endPacket();
+      u.beginPacket(dst, port);
+      u.write(pkt, OVU_HDR + n);
+      int rc = u.endPacket();
       if (rc == 1) {
         if (t > 0) g_diag_udp_retry_ok++;
         sent = true;
@@ -420,15 +449,19 @@ static bool send_frame_udp_locked(camera_fb_t *fb, IPAddress dst, uint16_t port)
   return true;
 }
 
-// 加锁入口: cam_udp 与 relay_task 的打洞/STUN 共用, 必须串行化
-bool send_frame_udp(camera_fb_t *fb, IPAddress dst, uint16_t port = TCP_PORT) {
-  if (!g_udp_mutex) return false;
-  if (xSemaphoreTake(g_udp_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-    g_diag_skip_frames++;              // 拿不到锁(打洞中), 宁丢一帧不并发
-    return false;
+// 发送入口。socket 参数化: 局域网/TURN 用 cam_udp(需与 relay_task 的打洞互斥),
+// P2P 直连用打洞锁定的候选 socket([1..2] 为独占口, 无并发, 不加锁不阻塞)。
+bool send_frame_udp(camera_fb_t *fb, WiFiUDP &u, IPAddress dst, uint16_t port = TCP_PORT) {
+  bool shared = (&u == &cam_udp);
+  if (shared) {
+    if (!g_udp_mutex) return false;
+    if (xSemaphoreTake(g_udp_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+      g_diag_skip_frames++;              // 拿不到锁(打洞中), 宁丢一帧不并发
+      return false;
+    }
   }
-  bool ok = send_frame_udp_locked(fb, dst, port);
-  xSemaphoreGive(g_udp_mutex);
+  bool ok = send_frame_udp_locked(fb, u, dst, port);
+  if (shared) xSemaphoreGive(g_udp_mutex);
   return ok;
 }
 #endif
@@ -634,7 +667,7 @@ void sender_task(void *arg) {
             g_diag_skip_frames++;
             ok = false;
           } else {
-            ok = send_frame_udp(&shim, dst);
+            ok = send_frame_udp(&shim, cam_udp, dst, TCP_PORT);
           }
         } else {
           ok = send_frame_locked(&shim);
@@ -653,11 +686,14 @@ void sender_task(void *arg) {
     // 分离后, UDP/TURN 发送不再阻塞 loop() 的 TCP accept 和命令解析。
     if (!handled) {
       if (g_p2p_active) {
-        // P2P 直连已建立: 视频经 UDP 直发对端(观众), 不再走中继
+        // P2P 直连已建立: 视频经打洞锁定的候选 socket 直发观众, 不再走中继。
+        // 锁定的是独立 socket([1..2])时不经 g_udp_mutex, 不与打洞/局域网发送竞争。
         if (g_udp_backoff_frames > 0) {
           g_udp_backoff_frames--;
           g_diag_skip_frames++;
-        } else if (send_frame_udp(&shim, g_p2p_peer_ip, g_p2p_peer_port)) {
+        } else if (g_p2p_lock_sock >= 0 && g_p2p_udp[g_p2p_lock_sock]
+                   && send_frame_udp(&shim, *g_p2p_udp[g_p2p_lock_sock],
+                                     g_p2p_lock_ip, g_p2p_lock_port)) {
           record_sent(t.len);
         } else {
           g_diag_skip_frames++;
@@ -733,6 +769,7 @@ void setup() {
   g_cam_mutex = xSemaphoreCreateMutex();
   g_cli_mutex = xSemaphoreCreateMutex();
   g_udp_mutex = xSemaphoreCreateMutex();
+  p2p_socks_init();    // P2P 候选 socket(主口 cam_udp + 2 个随机口, 用于交叉打洞)
   // 帧池(定长块)优先: 消除每帧 PSRAM malloc/free 抖动; 初始化失败自动回退逐帧 malloc
   if (frame_pool_init())
     Dbg.printf("[PSRAM] 帧池就绪 %d x %uB\n", FB_POOL_BLOCKS, (unsigned)FB_POOL_BLOCK);
@@ -755,34 +792,36 @@ void setup() {
 #ifdef ENABLE_WIFI
 // Web 配置页：通过设备所在局域网 IP（或上位机 --auto 发现）访问。
 void handle_web_root() {
-  String html = String("<!DOCTYPE html><html lang='zh'><meta charset='utf-8'>"
+  // 预分配缓冲 + 逐段 +=: 原写法一条 ~1.7KB 的 String 链式表达式会在内部反复
+  // realloc/释放, 且全部动态值散落在链中, 在 loopTask 上造成堆碎片。
+  // 现在页面缓冲一次性分配, 每行只产生一个小的临时对象。
+  String html; html.reserve(2200);
+  html += "<!DOCTYPE html><html lang='zh'><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "<title>OV2640 摄像头配置</title>"
     "<style>body{font-family:sans-serif;max-width:520px;margin:40px auto;padding:0 16px}"
     "input{width:100%;padding:10px;margin:6px 0 14px;box-sizing:border-box;font-size:16px}"
     "button{width:100%;padding:12px;background:#2f6fed;color:#fff;border:0;font-size:17px;border-radius:6px}"
     "table{width:100%;border-collapse:collapse}td{padding:6px 0}label{color:#555}</style></head><body>"
-    "<h2>OV2640 摄像头配置</h2>"
-    "<table>")
-    + "<tr><td>STA 状态</td><td>" + String(WiFi.status() == WL_CONNECTED ? "已连接" : "未连接")
-    + " / " + String(g_sta_ssid) + "</td></tr>"
-    + "<tr><td>设备ID</td><td>" + String(g_dev_id) + "</td></tr>"
-    + "<tr><td>中继</td><td>" + String(g_relay_host[0] ? String(g_relay_host) : String("未配置"))
-    + (g_relay_online ? " <b>(在线)</b>" : "") + "</td></tr></table>"
-    + "<hr><h3>设置摄像头要连接的目标 WiFi</h3>"
-    + "<form action='/save' method='get'>"
-    + "<label>WiFi 名称 (SSID)</label>"
-    + "<input name='ssid' value='" + String(g_sta_ssid) + "'>"
-    + "<label>密码</label>"
-    + "<input type='password' name='pass' value='" + String(g_sta_pass) + "'>"
-    + "<hr><h3>入网标识 / 跨网中继(可选)</h3>"
-    + "<label>设备ID (局域网发现与中继注册用, 留空自动)</label>"
-    + "<input name='id' value='" + String(g_dev_id) + "'>"
-    + "<label>中继服务端 IP:端口 (如 1.2.3.4:8000, 留空=仅局域网)</label>"
-    + "<input name='relay' value='" + String(g_relay_host) + "'>"
-    + "<button type='submit'>保存并连接</button></form>"
-    + "<p style='color:#888'>保存后摄像头将尝试连接该 WiFi。配置页通过目标网络的局域网 IP 访问"
-    + "(可在路由器管理页或上位机 --auto 发现)，SoftAP 已彻底关闭。</p></body></html>";
+    "<h2>OV2640 摄像头配置</h2><table>";
+  html += "<tr><td>STA 状态</td><td>" + String(WiFi.status() == WL_CONNECTED ? "已连接" : "未连接")
+          + " / " + String(g_sta_ssid) + "</td></tr>";
+  html += "<tr><td>设备ID</td><td>" + String(g_dev_id) + "</td></tr>";
+  html += "<tr><td>中继</td><td>" + String(g_relay_host[0] ? String(g_relay_host) : String("未配置"))
+          + (g_relay_online ? " <b>(在线)</b>" : "") + "</td></tr></table>";
+  html += "<hr><h3>设置摄像头要连接的目标 WiFi</h3><form action='/save' method='get'>";
+  html += "<label>WiFi 名称 (SSID)</label><input name='ssid' value='" + String(g_sta_ssid) + "'>";
+  html += "<label>密码</label><input type='password' name='pass' value='" + String(g_sta_pass) + "'>";
+  html += "<hr><h3>入网标识 / 跨网中继(可选)</h3>";
+  html += "<label>设备ID (局域网发现与中继注册用, 留空自动)</label>"
+          "<input name='id' value='" + String(g_dev_id) + "'>";
+  html += "<label>中继服务端 IP:端口 (如 1.2.3.4:8000, 留空=仅局域网)</label>"
+          "<input name='relay' value='" + String(g_relay_host) + "'>";
+  html += "<label>中继鉴权口令 (与服务器启动参数一致, 留空=不鉴权)</label>"
+          "<input name='token' value='" + String(g_relay_token) + "'>";
+  html += "<button type='submit'>保存并连接</button></form>"
+          "<p style='color:#888'>保存后摄像头将尝试连接该 WiFi。配置页通过目标网络的局域网 IP 访问"
+          "(可在路由器管理页或上位机 --auto 发现)，SoftAP 已彻底关闭。</p></body></html>";
   httpServer.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -791,6 +830,7 @@ void handle_web_save() {
   String _pass = httpServer.hasArg("pass") ? httpServer.arg("pass") : "";
   String _name = httpServer.hasArg("id")   ? httpServer.arg("id")   : "";
   String _relay= httpServer.hasArg("relay")? httpServer.arg("relay"): "";
+  String _token= httpServer.hasArg("token")? httpServer.arg("token"): "";
   _ssid.trim();
   if (_ssid.isEmpty()) {
     httpServer.send(200, "text/html; charset=utf-8",
@@ -799,11 +839,13 @@ void handle_web_save() {
   }
   if (_name.isEmpty()) _name = default_dev_id();
   _relay.trim();
+  _token.trim();
   g_prefs.begin("wifi", false);
   g_prefs.putString("ssid", _ssid);
   g_prefs.putString("pass", _pass);
   g_prefs.putString("id",   _name);
   g_prefs.putString("relay", _relay);
+  g_prefs.putString("token", _token);
   g_prefs.end();
 
   _ssid.toCharArray(g_sta_ssid, sizeof(g_sta_ssid));
@@ -811,6 +853,7 @@ void handle_web_save() {
   _name.toCharArray(g_dev_id,   sizeof(g_dev_id));
   if (_name != String(g_dev_name)) _name.toCharArray(g_dev_name, sizeof(g_dev_name));
   _relay.toCharArray(g_relay_host, sizeof(g_relay_host));
+  _token.toCharArray(g_relay_token, sizeof(g_relay_token));
 
   httpServer.send(200, "text/html; charset=utf-8",
       String("<html><meta charset='utf-8'><meta http-equiv='refresh' content='2;url=/'>"
@@ -893,44 +936,117 @@ void relay_send_payload(const uint8_t *data, size_t len) {
   relay_send_iov(data, len, NULL, 0, NULL, 0);
 }
 
-// P2P 打洞: 向对端公网端点发包, 并检测对端回包(打洞成功则置 g_p2p_active)。
-// 与 sender_task 共用 cam_udp, 需持 g_udp_mutex; 拿不到就跳过本轮(下轮再试)。
-void p2p_punch() {
-  if (g_p2p_peer_port == 0 || !g_udp_mutex) return;
-  if (xSemaphoreTake(g_udp_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
-  // 向对端发打洞包(内容任意, 目的让双方 NAT 建立映射)
-  cam_udp.beginPacket(g_p2p_peer_ip, g_p2p_peer_port);
-  cam_udp.write((const uint8_t *)"P2P", 3);
-  cam_udp.endPacket();
-  // 检测对端回包: 收到来自对端 IP 的 UDP 包 => 打洞成功
-  if (cam_udp.parsePacket() > 0) {
-    IPAddress src = cam_udp.remoteIP();
-    cam_udp.flush();                 // 丢弃该包内容, 避免残留在接收队列
-    if (src == g_p2p_peer_ip) {
+// ---- 可靠 P2P: 候选 socket 初始化 ----
+// [0]=cam_udp(主口, 与局域网分片共用); [1..2]=独立随机端口。
+// 多候选的意义: 端口受限锥形 NAT 只允许"本端曾向该目标发过包"的端口收包,
+// 对端回包源端口稍有偏差即失败; 3 个候选 x 对端 N 候选交叉探测成倍提高命中率。
+static void p2p_socks_init() {
+  if (g_p2p_socks_ready) return;
+  g_p2p_udp[0] = &cam_udp;
+  for (int i = 1; i < P2P_NSOCK; i++) {
+    WiFiUDP *u = new WiFiUDP();
+    if (!u) break;
+    if (u->begin(0) != 1) { delete u; break; }   // 0 = lwIP 分配随机端口
+    g_p2p_udp[i] = u;
+    Dbg.printf("[P2P] 候选 socket[%d] 就绪\n", i);
+  }
+  g_p2p_socks_ready = true;
+}
+
+// 对端候选是否匹配(回包校验: IP+端口都在候选表内, 防无关流量误判直连成功)
+static bool p2p_is_peer(IPAddress ip, uint16_t port) {
+  for (int j = 0; j < g_p2p_npeer; j++)
+    if (g_p2p_peer_portN[j] == port && g_p2p_peer_ipN[j] == ip) return true;
+  return false;
+}
+
+static void p2p_punch_locked(WiFiUDP *u) {
+  for (int j = 0; j < g_p2p_npeer; j++) {
+    u->beginPacket(g_p2p_peer_ipN[j], g_p2p_peer_portN[j]);
+    u->write((const uint8_t *)P2P_MAGIC, 3);
+    u->endPacket();
+  }
+}
+
+// 收包检测: 只认带 magic 且端点在候选表内的包; 命中即锁定该 (socket, 端点) 通道。
+static void p2p_detect_locked(WiFiUDP *u, int idx) {
+  while (u->parsePacket() > 0) {
+    uint8_t m[3] = {0, 0, 0};
+    int n = u->read(m, 3);
+    IPAddress sip = u->remoteIP();
+    uint16_t sp = u->remotePort();
+    u->flush();                        // 丢弃包体, 防残留在接收队列
+    if (n == 3 && memcmp(m, P2P_MAGIC, 3) == 0 && p2p_is_peer(sip, sp)) {
       g_p2p_last_rx = millis();
       if (!g_p2p_active) {
+        g_p2p_lock_sock = (int8_t)idx;
+        g_p2p_lock_ip = sip;
+        g_p2p_lock_port = sp;
         g_p2p_active = true;
-        Dbg.printf("[P2P] 打洞成功, 直连 %s:%u\n",
-                   g_p2p_peer_ip.toString().c_str(), g_p2p_peer_port);
+        g_turn_mode = false;           // 直连恢复, 撤 TURN
+        Dbg.printf("[P2P] 打洞成功 sock[%d] -> %s:%u\n", idx,
+                   sip.toString().c_str(), sp);
       }
+    }
+  }
+}
+
+// 交叉打洞: 本端全部 socket x 对端全部候选组合发包 + 收包检测。
+// 与 sender_task 共用 cam_udp([0]), 需持 g_udp_mutex; 拿不到就跳过本轮。
+void p2p_punch() {
+  if (g_p2p_npeer == 0 || !g_udp_mutex) return;
+  if (xSemaphoreTake(g_udp_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+  for (int i = 0; i < P2P_NSOCK; i++)
+    if (g_p2p_udp[i]) p2p_punch_locked(g_p2p_udp[i]);
+  for (int i = 0; i < P2P_NSOCK; i++)
+    if (g_p2p_udp[i]) p2p_detect_locked(g_p2p_udp[i], i);
+  xSemaphoreGive(g_udp_mutex);
+}
+
+// 排空全部候选 socket 的接收队列。带 magic 的包视为对端活性信号
+// (直连与 TURN 模式的降级判定都依赖它); 必须排空防 pbuf 积压。
+static void p2p_drain() {
+  if (!g_udp_mutex) return;
+  if (xSemaphoreTake(g_udp_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+  for (int i = 0; i < P2P_NSOCK; i++) {
+    WiFiUDP *u = g_p2p_udp[i];
+    if (!u) continue;
+    while (u->parsePacket() > 0) {
+      uint8_t m[3] = {0, 0, 0};
+      int n = u->read(m, 3);
+      u->flush();
+      if (n == 3 && memcmp(m, P2P_MAGIC, 3) == 0) g_p2p_last_rx = millis();
     }
   }
   xSemaphoreGive(g_udp_mutex);
 }
 
-// P2P 存活维护: 排空对端持续发来的保活/打洞包并刷新存活时间。
-// 必须排空, 否则包会一直积压在 lwIP 接收队列占用 pbuf。
-static void p2p_drain() {
-  if (!g_udp_mutex) return;
+// 直连保活: 持续向锁定端点发 magic。双向保活(旧版仅观众单向发,
+// 摄像头侧 NAT 映射过期后对端再也打不进来, 直连悄悄变死)。
+static void p2p_keepalive() {
+  if (!g_p2p_active || g_p2p_lock_sock < 0 || !g_udp_mutex) return;
+  WiFiUDP *u = g_p2p_udp[g_p2p_lock_sock];
+  if (!u) return;
   if (xSemaphoreTake(g_udp_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
-  while (cam_udp.parsePacket() > 0) {
-    if (cam_udp.remoteIP() == g_p2p_peer_ip) g_p2p_last_rx = millis();
-    cam_udp.flush();
-  }
+  u->beginPacket(g_p2p_lock_ip, g_p2p_lock_port);
+  u->write((const uint8_t *)P2P_MAGIC, 3);
+  u->endPacket();
   xSemaphoreGive(g_udp_mutex);
 }
 
-// 向服务器 UDP STUN 端口上报自身公网端点(打洞辅助)。服务器据此撮合双方。
+// 清空 P2P 会话状态(中继断开/观众更换时调用)
+static void p2p_reset() {
+  g_p2p_npeer = 0;
+  g_p2p_active = false;
+  g_p2p_lock_sock = -1;
+  g_p2p_lock_port = 0;
+  g_turn_mode = false;
+  g_p2p_last_rx = 0;
+  g_p2p_next_retry = 0;
+}
+
+// STUN 上报: 本端全部候选 socket 各报一次 -> 服务器为每个端口记录一个反射候选。
+// 与 sender_task 共用 cam_udp, 需持 g_udp_mutex。
 void p2p_stun() {
   if (g_relay_host[0] == 0 || !g_udp_mutex) return;
   char h[64] = {0}; int port = 8000;
@@ -938,12 +1054,16 @@ void p2p_stun() {
   IPAddress srv;
   if (!srv.fromString(h)) return;
   if (xSemaphoreTake(g_udp_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
-  cam_udp.beginPacket(srv, port + 1);   // UDP STUN 端口 = 中继 TCP 端口 + 1
   char msg[96];
   int n = snprintf(msg, sizeof(msg), "{\"t\":\"stun\",\"id\":\"%s\",\"role\":\"cam\"}",
                    g_dev_id);
-  cam_udp.write((const uint8_t*)msg, n);
-  cam_udp.endPacket();
+  for (int i = 0; i < P2P_NSOCK; i++) {
+    WiFiUDP *u = g_p2p_udp[i];
+    if (!u) continue;
+    u->beginPacket(srv, port + 1);     // UDP STUN 端口 = 中继 TCP 端口 + 1
+    u->write((const uint8_t*)msg, n);
+    u->endPacket();
+  }
   xSemaphoreGive(g_udp_mutex);
 }
 
@@ -980,7 +1100,7 @@ bool relay_read_msg() {
     if      (strstr(s, "viewer_attached")) g_relay_viewer = true;
     else if (strstr(s, "viewer_left")) {
       g_relay_viewer = false;
-      g_turn_mode = false;                 // 观众离开, 撤销 UDP 转发通道
+      p2p_reset();                         // 观众离开, 撤销 UDP 通道与过时候选
     }
     else if (strstr(s, "viewer_udp")) {
       // 观众已完成 STUN 上报(服务器持有其 UDP 公网端点) -> 视频立刻走 TURN UDP,
@@ -992,22 +1112,49 @@ bool relay_read_msg() {
       Dbg.println("[P2P] 观众 UDP 端点就绪, 视频改走 TURN");
     }
     else if (strstr(s, "p2p_peer")) {
-      // {"t":"p2p_peer","ip":"x.x.x.x","port":N} -> 对端(观众)公网端点
-      char *ip = strstr(s, "\"ip\":\"");
-      char *pt = strstr(s, "\"port\":");
-      if (ip && pt) {
-        ip += 6;
-        char ipbuf[32]; int k = 0;
-        while (*ip && *ip != '"' && k < 31) ipbuf[k++] = *ip++;
-        ipbuf[k] = 0;
-        int p = atoi(pt + 7);
-        if (p > 0 && p < 65536 && g_p2p_peer_ip.fromString(ipbuf)) {
-          g_p2p_peer_port = (uint16_t)p;
-          g_p2p_active = false;
-          g_p2p_punch_ms = millis();
-          g_p2p_punch_start = millis();
-          Dbg.printf("[P2P] 对端 %s:%d, 开始打洞\n", ipbuf, p);
+      // {"t":"p2p_peer","ip":"x","port":N,"cands":["ip:port",...]}
+      // -> 对端(观众)UDP 候选列表。可靠 P2P: 优先解析 cands 全部候选做交叉打洞;
+      //    无 cands(旧服务器)时回退单 ip/port, 行为与旧版一致。
+      g_p2p_npeer = 0;
+      char *c = strstr(s, "\"cands\":[");
+      if (c) {
+        c += 9;
+        while (g_p2p_npeer < P2P_NPEER_MAX && (c = strchr(c, '"')) != NULL) {
+          c++;
+          char *e = strchr(c, '"');
+          if (!e) break;
+          *e = 0;
+          char ipb[40]; int p = 0;
+          if (sscanf(c, "%39[^:]:%d", ipb, &p) == 2 && p > 0 && p < 65536
+              && g_p2p_peer_ipN[g_p2p_npeer].fromString(ipb)) {
+            g_p2p_peer_portN[g_p2p_npeer] = (uint16_t)p;
+            g_p2p_npeer++;
+          }
+          c = e + 1;
         }
+      }
+      if (g_p2p_npeer == 0) {              // 旧服务器兜底: 单 ip/port
+        char *ip = strstr(s, "\"ip\":\"");
+        char *pt = strstr(s, "\"port\":");
+        if (ip && pt) {
+          ip += 6;
+          char ipbuf[40]; int k = 0;
+          while (*ip && *ip != '"' && k < 39) ipbuf[k++] = *ip++;
+          ipbuf[k] = 0;
+          int p = atoi(pt + 7);
+          if (p > 0 && p < 65536 && g_p2p_peer_ipN[0].fromString(ipbuf)) {
+            g_p2p_peer_portN[0] = (uint16_t)p;
+            g_p2p_npeer = 1;
+          }
+        }
+      }
+      if (g_p2p_npeer > 0) {
+        g_p2p_active = false;
+        g_p2p_lock_sock = -1;
+        g_p2p_punch_ms = millis();
+        g_p2p_punch_start = millis();
+        g_p2p_next_retry = 0;
+        Dbg.printf("[P2P] 对端 %u 个候选, 开始交叉打洞\n", g_p2p_npeer);
       }
     }
     // 其余 JSON(reg_ok/error)忽略
@@ -1035,11 +1182,14 @@ void relay_task(void *arg) {
       relay_cli.setNoDelay(true);
       g_relay_online = true;
       last_hb = millis();
-      char reg[160];
-      snprintf(reg, sizeof(reg), "{\"t\":\"reg\",\"id\":\"%s\",\"name\":\"%s\"}",
-               g_dev_id, g_dev_name);
+      // 注册携带鉴权口令: 服务端若设了 token, 不带或不匹配会被拒绝并断连
+      char reg[200];
+      snprintf(reg, sizeof(reg),
+               "{\"t\":\"reg\",\"id\":\"%s\",\"name\":\"%s\",\"token\":\"%s\"}",
+               g_dev_id, g_dev_name, g_relay_token);
       relay_send_payload((const uint8_t*)reg, strlen(reg));
-      Dbg.printf("[中继] 已注册 id=%s\n", g_dev_id);
+      Dbg.printf("[中继] 已注册 id=%s (token=%s)\n", g_dev_id,
+                 g_relay_token[0] ? "已配置" : "无");
       p2p_stun();   // 上报自身 UDP 公网端点, 供服务器 P2P 撮合
       bool conn = true;
       while (conn) {
@@ -1051,33 +1201,55 @@ void relay_task(void *arg) {
             relay_send_payload((const uint8_t*)"{\"t\":\"hb\"}", 10);
             last_hb = now;
           }
-          // P2P 状态机:
-          //   未建立 -> 每 100ms 打洞, 超时(3s)放弃, 切换 TURN 兜底
-          //   已建立 -> 每 500ms 排空对端保活包刷新存活; 3s 无包判定直连失活,
-          //             回退 TURN 并重新尝试打洞(修复: 此前 g_p2p_active 一旦置位
-          //             就永不清零, 对端 NAT 映射失效后摄像头会一直往黑洞发流)
-          if (g_p2p_peer_port != 0) {
+          // P2P 状态机(可靠版: 降级链闭环 + 周期重试恢复):
+          //   打洞中  -> 每 100ms 交叉打洞; 3s 未通 -> TURN, 但保留候选, 30s 后重试
+          //   直连中  -> 每 500ms 保活+排空; 3s 无对端包 -> 失活, 立即重打洞+降 TURN
+          //   TURN 中 -> 5s 无对端包(观众 socket 已关, TURN 也是黑洞) -> 降回 TCP 中继;
+          //              期间仍每 30s 重试打洞, 网络恢复即无缝切回直连
+          //   判定信号统一为"多久没收到观众的 magic 包"(观众 _p2p_loop 每 500ms 发)
+          if (g_p2p_npeer > 0) {
             if (g_p2p_active) {
-              if (now - g_p2p_punch_ms >= 500) {
+              if (now - g_p2p_punch_ms >= P2P_KEEPALIVE_MS) {
                 g_p2p_punch_ms = now;
+                p2p_keepalive();               // 双向保活, 维持两侧 NAT 映射
                 p2p_drain();
-                if (now - g_p2p_last_rx > 3000) {
-                  Dbg.println("[P2P] 直连失活, 回退 TURN");
+                if (now - g_p2p_last_rx > P2P_DEAD_MS) {
+                  Dbg.println("[P2P] 直连失活, 重新打洞并降 TURN");
                   g_p2p_active = false;
+                  g_p2p_lock_sock = -1;
                   g_turn_mode  = true;
                   g_p2p_punch_start = now;
+                  g_p2p_next_retry = now + P2P_RETRY_MS;
                 }
               }
-            } else if (now - g_p2p_punch_ms >= 100) {
-              p2p_punch();
+            } else if (now - g_p2p_punch_ms >= P2P_PUNCH_MS) {
               g_p2p_punch_ms = now;
-              if (now - g_p2p_punch_start >= 3000) {
-                Dbg.println("[P2P] 打洞超时, 切换 TURN 兜底");
-                g_p2p_peer_port = 0;
-                g_turn_mode = true;          // 帧走 send_frame_udp_via_turn
+              p2p_punch();
+              if (now - g_p2p_punch_start >= P2P_PUNCH_TMO
+                  && !g_p2p_active && !g_turn_mode) {
+                Dbg.println("[P2P] 打洞超时, 切换 TURN 兜底(候选保留, 周期重试)");
+                g_turn_mode = true;            // 帧走 send_frame_udp_via_turn
                 g_turn_last_stun = now;
+                g_p2p_next_retry = now + P2P_RETRY_MS;
               }
             }
+          }
+          // 降级后的周期恢复: TURN/TCP 期间每 30s 再试一轮打洞。
+          // 网络状况会变(NAT 映射刷新/观众换网), 恢复直连可卸掉服务器带宽。
+          if (!g_p2p_active && g_p2p_npeer > 0 && g_p2p_next_retry != 0
+              && now >= g_p2p_next_retry) {
+            Dbg.println("[P2P] 周期重试打洞...");
+            g_p2p_next_retry = now + P2P_RETRY_MS;
+            g_p2p_punch_start = now;
+            g_p2p_punch_ms = 0;
+          }
+          // TURN 失活检测: 观众已停流/退出时其 socket 关闭, TURN 转向收不到,
+          // 此时必须降回 TCP 中继 —— 旧版 TURN 优先级高于 TCP 且失败不可感知,
+          // 会一直往死端点发帧, TCP 兜底永远轮不到。
+          if (g_turn_mode && !g_p2p_active
+              && now - g_p2p_last_rx > P2P_TURN_DEAD_MS) {
+            Dbg.println("[P2P] TURN 无观众应答, 降回 TCP 中继");
+            g_turn_mode = false;
           }
           // ICE 候选刷新/TURN 保活: 维持服务器上 cam 的反射映射, 对称 NAT 也能收到转向
           ice_poll();
@@ -1087,10 +1259,7 @@ void relay_task(void *arg) {
       }
       g_relay_online = false;
       g_relay_viewer = false;
-      g_p2p_active = false;
-      g_p2p_peer_port = 0;
-      g_turn_mode = false;
-      g_p2p_last_rx = 0;
+      p2p_reset();
       Dbg.println("[中继] 连接断开");
       relay_cli.stop();
     } else {
@@ -1190,13 +1359,17 @@ void setup_wifi() {
   String _name = g_prefs.getString("name", String(AP_SSID));
   String _id   = g_prefs.getString("id",   default_dev_id());
   String _relay= g_prefs.getString("relay", RELAY_HOST_DEFAULT);   // "host:port", 空=关闭中继
+  String _token= g_prefs.getString("token", String(RELAY_TOKEN));  // 中继鉴权口令
   g_prefs.end();
   _ssid.toCharArray(g_sta_ssid, sizeof(g_sta_ssid));
   _pass.toCharArray(g_sta_pass, sizeof(g_sta_pass));
   _name.toCharArray(g_dev_name, sizeof(g_dev_name));
   _id.toCharArray(g_dev_id,   sizeof(g_dev_id));
   _relay.toCharArray(g_relay_host, sizeof(g_relay_host));
-  if (g_relay_host[0] != 0) Dbg.printf("[中继] 目标: %s (id=%s)\n", g_relay_host, g_dev_id);
+  _token.toCharArray(g_relay_token, sizeof(g_relay_token));
+  if (g_relay_host[0] != 0)
+    Dbg.printf("[中继] 目标: %s (id=%s token=%s)\n", g_relay_host, g_dev_id,
+               g_relay_token[0] ? "已配置" : "无");
 
   // 凭据加载完再定模式: 无 STA 凭据(NVS 与编译期都没有)时开 SoftAP 兜底,
   // 保证配网页可达、设备不会变成"连不上也配不了"的死机;
@@ -1361,12 +1534,24 @@ void adapt_quality() {
 }
 #endif
 
+// 阻塞等待期间让出 Web 配置页与日志(仅限 loop 任务: WebServer 非线程安全,
+// 中继命令在核0 relay_task 上调用 handle_cmd 时不得碰 httpServer)。
+static void yield_web(uint32_t ms) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+#ifdef ENABLE_WIFI
+    if (strcmp(pcTaskGetTaskName(NULL), "loopTask") == 0) httpServer.handleClient();
+#endif
+    delay(1);
+  }
+}
+
 // 上位机命令统一处理（串口与 TCP 共用协议）
 void handle_cmd(int c, Stream &in) {
   if (c == 'P' || c == 'p') {
     Dbg.println("CMD_PHOTO");
     camera_change_framesize(HI_FRAME);
-    delay(500);
+    yield_web(500);   // 原 delay(500): 拍照期间 Web 配置页冻结、DIAG 停摆
     int attempt = 0;
     camera_fb_t *fb = NULL;
     bool locked = false;
@@ -1379,7 +1564,7 @@ void handle_cmd(int c, Stream &in) {
 #endif
     while (cam_grab_ok && !fb && attempt < 10) {
       fb = esp_camera_fb_get();
-      if (!fb) { delay(50); attempt++; }
+      if (!fb) { yield_web(50); attempt++; }
     }
     if (!fb) {
 #ifdef ENABLE_WIFI

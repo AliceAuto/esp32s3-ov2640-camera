@@ -475,7 +475,8 @@ def build_ui(root):
     ui["mode_cb"] = mode_cb
 
     ttk.Label(bar, text="预览:").pack(side="left")
-    res_cb = ttk.Combobox(bar, values=RES_LABELS, state="readonly", width=9)
+    # width 需容纳 "UXGA 1600x1200" 这类带尺寸标签, 否则选中框显示被截断
+    res_cb = ttk.Combobox(bar, values=RES_LABELS, state="readonly", width=14)
     res_cb.set(res_label("QVGA")); res_cb.pack(side="left", padx=(4, 10))
     ui["res_cb"] = res_cb
 
@@ -488,7 +489,7 @@ def build_ui(root):
     ui["q_var"], ui["q_lbl"] = q_var, q_lbl
 
     ttk.Label(bar, text="拍照:").pack(side="left")
-    photo_cb = ttk.Combobox(bar, values=RES_LABELS, state="readonly", width=9)
+    photo_cb = ttk.Combobox(bar, values=RES_LABELS, state="readonly", width=14)
     photo_cb.set(res_label("UXGA")); photo_cb.pack(side="left", padx=(4, 4))
     ui["photo_cb"] = photo_cb
 

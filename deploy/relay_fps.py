@@ -8,6 +8,7 @@ PORT  = int(sys.argv[2]) if len(sys.argv) > 2 else 8001
 DEV   = sys.argv[3] if len(sys.argv) > 3 else "cam-1DCD23D8"
 DUR   = float(sys.argv[4]) if len(sys.argv) > 4 else 12.0
 CMD   = sys.argv[5] if len(sys.argv) > 5 else ""   # 如 "Vv" 切 VGA / "Vq" 切 QVGA
+TOKEN = sys.argv[6] if len(sys.argv) > 6 else ""   # 服务器启用鉴权时的口令
 
 def exact(s, n):
     d = b""
@@ -25,10 +26,16 @@ def sendjson(s, o):
     s.sendall(len(json.dumps(o)).to_bytes(4, "big") + json.dumps(o).encode())
 
 s = socket.create_connection((HOST, PORT))
-sendjson(s, {"t": "watch", "id": DEV})
+watch = {"t": "watch", "id": DEV}
+if TOKEN:
+    watch["token"] = TOKEN
+sendjson(s, watch)
 r = json.loads(recvmsg(s))
 if r.get("t") != "watch_ok":
-    print(f"[FAIL] watch: {r}"); sys.exit(1)
+    print(f"[FAIL] watch: {r}")
+    if r.get("msg") == "unauthorized":
+        print("提示: 服务器启用了 token 鉴权, 用法 python relay_fps.py HOST PORT DEV DUR CMD TOKEN")
+    sys.exit(1)
 json.loads(recvmsg(s))  # p2p_peer
 if CMD:
     cmd = CMD.encode() + b"\x00"
