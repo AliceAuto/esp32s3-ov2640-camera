@@ -448,9 +448,17 @@ void enqueue_frame(camera_fb_t *fb) {
   t.fmt = fb->format;
   t.w = fb->width;
   t.h = fb->height;
+  // 队列满=网络消费不动。策略: 丢【最旧】帧腾位让进【最新】帧(丢旧保新),
+  // 保证发送端永远取到当前最新画面, 观众看到实时而非积压的旧帧。
+  // 采集侧始终满帧率入队, 帧率不被通信延迟拖慢。
+  TxFrame victim;
+  if (xQueueReceive(g_txq, &victim, 0) == pdTRUE) {
+    heap_caps_free(victim.buf);
+    g_diag_skip_frames++;              // 丢旧保新: 被顶掉一帧, 引入最新帧
+  }
   if (xQueueSend(g_txq, &t, 0) != pdTRUE) {
     heap_caps_free(t.buf);
-    g_diag_skip_frames++;              // 队列满=网络消费不动, 主动丢新帧保采集节拍
+    g_diag_skip_frames++;
     return;
   }
   g_diag_cap_bytes += fb->len;
