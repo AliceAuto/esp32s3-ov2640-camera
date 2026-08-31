@@ -671,6 +671,39 @@ def close():
         pass
 
 
+display_q = queue.Queue(maxsize=2)
+
+
+def decode_worker(stop_ev):
+    """后台解码线程: 从 prev_q 取最新帧解码为 PIL Image, 放入 display_q。
+    将 JPEG 解码(VGA 下 15-30ms)移出 tkinter 主线程, 消除 UI 响应卡顿。"""
+    while not stop_ev.is_set():
+        latest = None
+        try:
+            while True:
+                latest = prev_q.get(timeout=0.1)
+        except queue.Empty:
+            pass
+        if latest is None:
+            continue
+        fmt, raw, w, h = latest
+        ui["last_frame"] = latest          # 供 snapshot() 使用(GIL 下原子赋值)
+        try:
+            if fmt == 1:
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+            else:
+                img = Image.frombytes("RGB", (w, h), convert_rgb(raw, w, h))
+            # display_q 丢旧保新: 解码慢时只保留最新一帧
+            try:
+                while not display_q.empty():
+                    display_q.get_nowait()
+            except queue.Empty:
+                pass
+            display_q.put(img)
+        except Exception as e:
+            print(f"解码异常: {e}", flush=True)
+
+
 def render_loop(root):
     stop_ev = G["stop"]
 
@@ -687,24 +720,15 @@ def render_loop(root):
         G["photo_until"] = 0.0
         finish_photo(False)
 
-    # 3) 预览: 排空队列只画最新一帧
-    latest = None
+    # 3) 预览: 从后台解码线程取最新已解码帧(解码已移出主线程, 避免 UI 卡顿)
+    latest_img = None
     try:
         while True:
-            latest = prev_q.get_nowait()
+            latest_img = display_q.get_nowait()
     except queue.Empty:
         pass
-    if latest:
-        fmt, raw, w, h = latest
-        ui["last_frame"] = latest
-        try:
-            if fmt == 1:
-                img = Image.open(io.BytesIO(raw)).convert("RGB")
-            else:
-                img = Image.frombytes("RGB", (w, h), convert_rgb(raw, w, h))
-            show_on_video(img)
-        except Exception as e:
-            ui["info"].config(text=f"解码异常: {e}")
+    if latest_img:
+        show_on_video(latest_img)
 
     # 4) 状态栏节流刷新(4Hz)
     now = time.time()
@@ -739,6 +763,8 @@ def main():
     build_ui(root)
     th = threading.Thread(target=reader, args=(G["stop"],), daemon=True)
     th.start()
+    th_dec = threading.Thread(target=decode_worker, args=(G["stop"],), daemon=True)
+    th_dec.start()
     root.after(200, render_loop, root)
     root.mainloop()
     G["stop"].set()

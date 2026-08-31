@@ -45,5 +45,8 @@ tools/arduino-cli.exe
 esp32s3_camera_serial/host/shots/
 esp32s3_camera_serial/host/photos/
 
+# ========== 本地凭据（不入库） ==========
+esp32s3_camera_pio/src/secrets.h
+
 # ========== 库源码副本 ==========
 esp32s3_camera_serial/libraries/

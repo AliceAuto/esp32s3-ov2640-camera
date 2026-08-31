@@ -19,7 +19,8 @@ import tkinter as tk
 #   WiFi:   python live_capture.py --wifi [host] [port]   (host 默认 192.168.4.1)
 #   自动:   python live_capture.py --auto                 (UDP广播发现后直连局域网摄像头)
 #   中继:   python live_capture.py --relay 中继服务器:端口 [--id 设备ID]
-_FLAGS = ("--wifi", "--auto", "--relay", "--id")
+_FLAGS = ("--wifi", "--auto", "--relay", "--id", "--p2p")
+_P2P = "--p2p" in sys.argv   # 默认纯 TCP 中继(可靠); 加 --p2p 才启用打洞/TURN(跨网直连提速, 不稳定)
 if "--relay" in sys.argv:
     MODE = "relay"
 elif "--auto" in sys.argv:
@@ -183,10 +184,10 @@ class RelayIo:
             target = devs[0]
             print(f"中继在线: {[(d['id'], d.get('name')) for d in devs]}", flush=True)
             print(f"未指定 --id, 自动选择第一个: {target['id']}", flush=True)
-        # 先建 P2P UDP 套接字并上报自身公网端点(STUN), 再 watch。
-        # 这样服务器在 watch 时已拿到本端 UDP 端点, 撮合给对端。
-        self._open_p2p_sock()
-        self._send_stun(target["id"])
+        # 默认不做打洞: 只走可靠的 TCP 中继。只有 --p2p 时才上报 UDP 端点/打洞。
+        if _P2P:
+            self._open_p2p_sock()
+            self._send_stun(target["id"])
         self._send_json({"t": "watch", "id": target["id"]})
         r = json.loads(self._recv_exact(int.from_bytes(self._recv_exact(4), "big")))
         if r.get("t") != "watch_ok":
@@ -275,7 +276,7 @@ class RelayIo:
             o = json.loads(msg.decode("utf-8", "ignore"))
         except Exception:
             return
-        if o.get("t") == "p2p_peer":
+        if o.get("t") == "p2p_peer" and _P2P:
             ip = o.get("ip")
             port = o.get("port")
             if ip and port:
@@ -707,12 +708,16 @@ def render():
         data = None
     if data:
         img, w, h = data
-        scale = max(1, 640 // max(w, 1))
-        big = img.resize((w * scale, h * scale), Image.NEAREST)
-        photo_image = ImageTk.PhotoImage(big)
-        label.config(image=photo_image)
-        label.image = photo_image
-        fps_lbl.config(text=f"帧数 {frame_count[0]} | 预览 {w}x{h}")
+        # 固定显示框内"只缩小不放大": 大分辨率等比缩小, 小分辨率按原生像素居中。
+        # 分辨率与画面大小无关, 切分辨率只影响清晰度, 绝不把画面放大。
+        scale = min(1.0, DISP_W / max(w, 1), DISP_H / max(h, 1))
+        nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+        disp = img.resize((nw, nh), Image.LANCZOS)
+        photo_image = ImageTk.PhotoImage(disp)
+        canvas.delete("all")
+        canvas.create_image(DISP_W // 2, DISP_H // 2, image=photo_image)
+        canvas.image = photo_image
+        fps_lbl.config(text=f"帧数 {frame_count[0]} | 预览 {w}x{h} -> 显示 {nw}x{nh}")
     root.after(30, render)
 
 
@@ -732,8 +737,9 @@ btn.pack(side="right")
 
 status_lbl = tk.Label(root, text="连接中...", anchor="w", padx=6, fg="#666")
 status_lbl.pack(fill="x")
-label = tk.Label(root, bg="black")
-label.pack()
+DISP_W, DISP_H = 640, 480   # 固定显示框: 任何分辨率等比缩放后居中, 画面大小不变只更清晰
+canvas = tk.Canvas(root, width=DISP_W, height=DISP_H, bg="black", highlightthickness=0)
+canvas.pack()
 fps_lbl = tk.Label(root, text="", anchor="w", padx=6)
 fps_lbl.pack(fill="x")
 

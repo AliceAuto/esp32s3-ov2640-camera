@@ -36,10 +36,15 @@ OV2640 跨网信令 + 中继服务端。
 用法:  python relay_server.py [port]
 默认端口 8000。需在云服务器防火墙/安全组放行 TCP 8000。
 """
-import sys, threading, time, json, socket, traceback
+import sys, threading, time, json, socket, traceback, queue
 from collections import OrderedDict
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+
+# 每个连接的出站队列深度(单位: 条消息)。视频帧走 UDP 之外的 TCP 中继时,
+# 一条消息就是一整帧(可达数十 KB)。队列化后慢观众只积压自己的队列,
+# 不再把 sendall 的阻塞反压到摄像头的接收线程 -> 摄像头 TCP 窗口关窗 -> sender_task 停摆。
+VIDEO_QUEUE_MAX = 8
 
 # ---------------------------------------------------------------------------
 # 连接对象: 持有 socket + 身份(device / viewer) + 转发对端
@@ -55,14 +60,48 @@ class Conn:
         self.peer = None           # 中继对端连接
         self.running = True
         self.pause_peer = False    # 转发暂停标记(供接收线程用)
+        # 出站队列(由独立发送线程消费): 视频帧队列满时丢最旧保最新,
+        # 使慢观众只影响自己, 不会把阻塞反压到摄像头
+        self.out_q = queue.Queue(maxsize=VIDEO_QUEUE_MAX)
+        self.out_alive = True
+
+    def start_out(self):
+        threading.Thread(target=self._out_loop, daemon=True).start()
+
+    def _out_loop(self):
+        while self.out_alive:
+            item = self.out_q.get()
+            if item is None:                      # 关闭哨兵
+                break
+            try:
+                self.sock.sendall(len(item).to_bytes(4, "big") + item)
+            except OSError:
+                self.close()
+                break
 
     def send_payload(self, payload: bytes):
+        """入队一条待发消息, 不阻塞调用方(摄像头接收线程)。
+
+        JSON 信令: 体积小且必须可靠送达 -> 阻塞入队。
+        视频帧(非 JSON): 体积大且实时性强 -> 队列满时丢最旧保最新。
+        """
         if not self.running:
             return
-        try:
-            self.sock.sendall(len(payload).to_bytes(4, "big") + payload)
-        except OSError:
-            self.close()
+        if payload[:1] == b"{":
+            try:
+                self.out_q.put(payload, timeout=5)
+            except queue.Full:
+                pass                              # 极小的信令, 满了说明对端基本已死
+            return
+        while True:
+            try:
+                self.out_q.put_nowait(payload)
+                return
+            except queue.Full:
+                try:
+                    self.out_q.get_nowait()       # 丢最旧一帧
+                except queue.Empty:
+                    pass
 
     def send_json(self, obj):
         self.send_payload(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
@@ -71,6 +110,11 @@ class Conn:
         if not self.running:
             return
         self.running = False
+        self.out_alive = False
+        try:
+            self.out_q.put_nowait(None)           # 唤醒发送线程退出
+        except Exception:
+            pass
         self.srv.detach(self)
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
@@ -177,6 +221,15 @@ class Server:
             cam.send_json({"t": "p2p_peer", "ip": view_ep[0], "port": view_ep[1]})
             c.send_json({"t": "p2p_peer", "ip": cam_ep[0], "port": cam_ep[1]})
             self.log(f"观众 {c.addr} 观看 {target_id} (p2p_peer 已下发)")
+            # 观众若已 STUN 上报(即服务器持有其 UDP 公网端点), 通知摄像头视频直接走
+            # TURN UDP, 不必先经过数秒 TCP 中继 —— TCP 中继是队头阻塞的, 跨网帧率
+            # 会被单帧 RTT 卡住。未上报端点的观众(如 deploy/relay_fps.py)收不到此
+            # 信令, 行为保持原样, 兼容旧的纯 TCP 中继用法。
+            with self.udp_lock:
+                have_viewer_ep = f"viewer:{target_id}" in self.udp_endpoints
+            if have_viewer_ep:
+                cam.send_json({"t": "viewer_udp"})
+                self.log(f"观众 {c.addr} 已 STUN, 通知 {target_id} 视频改走 TURN UDP")
 
     def _recv_exact(self, c: Conn, n: int):
         """读满 n 字节; 返回空 bytes 表示连接已关闭/出错。"""
@@ -192,6 +245,7 @@ class Server:
         return data
 
     def handle(self, c: Conn):
+        c.sock.settimeout(45)  # 45s 无数据 = 死连接(NAT 半开), 强制断开清理
         try:
             while c.running:
                 head = self._recv_exact(c, 4)
@@ -212,6 +266,7 @@ class Server:
             sock, addr = listener.accept()
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             c = Conn(sock, addr, self)
+            c.start_out()      # 出站发送线程(队列化, 慢对端不再反压转发链)
             threading.Thread(target=self.handle, args=(c,), daemon=True).start()
 
     def udp_stun_loop(self):
@@ -277,6 +332,36 @@ class Server:
                 continue
             # 忽略其他
 
+    def status_loop(self):
+        """简单 HTTP /status 端点: 返回在线设备数、活跃中继对数、UDP 端点数。"""
+        import http.server
+        srv_ref = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/status":
+                    with srv_ref.lock:
+                        n_devs = len(srv_ref.devices)
+                        n_relays = sum(1 for d in srv_ref.devices.values() if d.peer is not None)
+                    with srv_ref.udp_lock:
+                        n_eps = len(srv_ref.udp_endpoints)
+                    body = json.dumps({"devices": n_devs, "active_relays": n_relays,
+                                       "udp_endpoints": n_eps}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        httpd = http.server.HTTPServer(("0.0.0.0", self.port + 2), Handler)
+        self.log(f"监控端点: http://0.0.0.0:{self.port + 2}/status")
+        httpd.serve_forever()
+
     def serve(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -284,6 +369,7 @@ class Server:
         listener.listen(32)
         self.log(f"relay_server 监听 0.0.0.0:{self.port} (放行 TCP {self.port})")
         threading.Thread(target=self.udp_stun_loop, daemon=True).start()
+        threading.Thread(target=self.status_loop, daemon=True).start()
         try:
             self.accept_loop(listener)
         except KeyboardInterrupt:
