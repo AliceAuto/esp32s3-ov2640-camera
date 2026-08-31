@@ -215,34 +215,67 @@ class Server:
             threading.Thread(target=self.handle, args=(c,), daemon=True).start()
 
     def udp_stun_loop(self):
-        """UDP STUN 辅助: 接收各端打洞前的公网端点上报, 记录并回显。
-        数据报: {"t":"stun","id":"<cam_id>","role":"cam|viewer"}。"""
+        """UDP 辅助端口(port+1): 三层 ICE 候选服务。
+        1) STUN 反射:   {"t":"stun","id":"<cam_id>","role":"cam|viewer"} -> 记录公网端点并回显
+                       (这是 server-reflexive 候选 + TURN 客户端到本机的恒等映射通道)。
+        2) TURN 转发:   "T2C" 信封(观众->摄像头) / "C2V"(摄像头->观众)。
+                       栈: magic(3) "T2C"/"C2V" + cam_id_len(4) + cam_id + payload。
+                       服务器按 cam_id 把 payload 转向到对端真实公网 UDP 端点。
+                       由于对端持续 STUN 上报保活其到本机的映射, 对称 NAT 也能送达。
+        3) 保活续期:   任何 STUN/TURN 数据报都会刷新 udp_endpoints[目标]，保持映射。"""
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", self.udp_port))
-        self.log(f"UDP STUN 监听 0.0.0.0:{self.udp_port} (放行 UDP {self.udp_port})")
+        self.log(f"UDP ICE/TURN 监听 0.0.0.0:{self.udp_port} (放行 UDP {self.udp_port})")
         while True:
             try:
-                data, addr = s.recvfrom(2048)
+                data, addr = s.recvfrom(4096)
             except OSError:
                 continue
-            try:
-                msg = json.loads(data.decode("utf-8", "ignore"))
-            except Exception:
+            cam_id = ""
+            if data[:1] == b"{":
+                try:
+                    msg = json.loads(data.decode("utf-8", "ignore"))
+                except Exception:
+                    continue
+                cam_id = msg.get("id") or ""
+                if msg.get("t") == "stun":
+                    role = msg.get("role") or "cam"
+                    key = f"cam:{cam_id}" if role == "cam" else f"viewer:{cam_id}"
+                    with self.udp_lock:
+                        self.udp_endpoints[key] = (addr[0], addr[1])
+                    self.log(f"STUN {role} {cam_id}: {addr[0]}:{addr[1]}")
+                    try:
+                        s.sendto(json.dumps({"t": "stun_ok", "ip": addr[0],
+                                             "port": addr[1]}).encode(), addr)
+                    except OSError:
+                        pass
+                    continue
+                else:
+                    continue
+            elif data[:3] in (b"T2C", b"C2V"):
+                # 信封: magic(3) + cam_id_len(4) + cam_id + payload
+                magic = data[:3]
+                if len(data) < 7:
+                    continue
+                nl = int.from_bytes(data[3:7], "big")
+                if nl <= 0 or 7 + nl > len(data):
+                    continue
+                cam_id = data[7:7 + nl].decode("utf-8", "ignore")
+                payload = data[7 + nl:]
+                target_key = f"viewer:{cam_id}" if magic == b"C2V" else f"cam:{cam_id}"
+                with self.udp_lock:
+                    target = self.udp_endpoints.get(target_key)
+                if target:
+                    self.log(f"TURN {magic.decode()} cam={cam_id} -> {target} {len(payload)}B")
+                    try:
+                        s.sendto(payload, target)
+                    except OSError:
+                        pass
+                else:
+                    self.log(f"TURN 无对端端点 cam={cam_id} dir={magic.decode()}")
                 continue
-            if msg.get("t") != "stun":
-                continue
-            cam_id = msg.get("id") or ""
-            role = msg.get("role") or "cam"
-            key = f"cam:{cam_id}" if role == "cam" else f"viewer:{cam_id}"
-            with self.udp_lock:
-                self.udp_endpoints[key] = (addr[0], addr[1])
-            self.log(f"STUN {role} {cam_id}: {addr[0]}:{addr[1]}")
-            try:
-                s.sendto(json.dumps({"t": "stun_ok", "ip": addr[0], "port": addr[1]}).encode(),
-                         addr)
-            except OSError:
-                pass
+            # 忽略其他
 
     def serve(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -73,6 +73,13 @@ def main():
     assert _att["t"] == "viewer_attached", _att
     passed.append("观看建立 viewer_attached/watch_ok")
 
+    # ---- P2P 撮合: 双方应收到 p2p_peer(对端公网端点) ----
+    _p2p_cam = json.loads(recv_msg(cam).decode())
+    assert _p2p_cam["t"] == "p2p_peer" and _p2p_cam.get("ip") and _p2p_cam.get("port"), _p2p_cam
+    _p2p_v = json.loads(recv_msg(v).decode())
+    assert _p2p_v["t"] == "p2p_peer" and _p2p_v.get("ip") and _p2p_v.get("port"), _p2p_v
+    passed.append(f"P2P 撮合 p2p_peer cam->{_p2p_cam['ip']}:{_p2p_cam['port']} viewer->{_p2p_v['ip']}:{_p2p_v['port']}")
+
     # ---- 摄像头数据上行 -> 终端收到 ----
     send_payload(cam, b"\xff\xd8FAKEFRAME\xff\xd9")
     got = recv_msg(v)
