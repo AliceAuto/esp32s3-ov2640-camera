@@ -36,7 +36,6 @@
 // ---- 函数原型（.ino 由 Arduino 自动生成，.cpp 需手动声明）----
 int fb_count_for(framesize_t fs);
 bool send_frame(camera_fb_t *fb);
-bool send_frame_udp(camera_fb_t *fb, IPAddress dst);
 void send_frame_serial(camera_fb_t *fb);
 framesize_t framesize_from_code(char code);
 void apply_color_calib();
@@ -58,6 +57,8 @@ void handle_web_save();
 void disc_task(void *arg);
 void relay_task(void *arg);
 bool send_frame_relay(camera_fb_t *fb);
+void p2p_punch();
+void p2p_stun();
 String default_dev_id();
 
 // UART0 = CH343 转串口所在通道（TX=GPIO43, RX=GPIO44），避免默认 Serial 走 USB-CDC。
@@ -118,6 +119,13 @@ static WiFiClient   relay_cli;
 static SemaphoreHandle_t g_relay_tx  = NULL;     // 保护 relay 发送(信令与帧交错用)
 static volatile bool g_relay_viewer  = false;    // 有观众经中继在观看
 static volatile bool g_relay_online  = false;    // 已连上中继服务端
+
+// ---- P2P 直连(尽力而为, 失败回退中继) ----
+static IPAddress     g_p2p_peer_ip;              // P2P 对端(观众)公网 IP
+static volatile uint16_t g_p2p_peer_port = 0;    // P2P 对端公网端口(0=未配置)
+static volatile bool g_p2p_active = false;       // P2P 直连已建立(视频走 UDP 直连)
+static uint32_t      g_p2p_punch_ms = 0;         // 上次打洞发包时间
+static uint32_t      g_p2p_punch_start = 0;      // 打洞开始时间(超时放弃用)
 
 // 中继链路收到的一整条命令数据; 用轻量 Stream 喂给 handle_cmd
 class ByteStream : public Stream {
@@ -261,7 +269,7 @@ void send_frame_serial(camera_fb_t *fb) {
 // 通过 UDP 把一整帧分片成多个数据报发送（预览用，丢帧不重传）。
 // 数据报布局: 12B头 + 分片。
 //   头: "OVU"(3) fmt(1) seq(2) cnt_minus1(1) idx(1) w(2) h(2)  fmt:0=RGB565 1=JPEG
-bool send_frame_udp(camera_fb_t *fb, IPAddress dst) {
+bool send_frame_udp(camera_fb_t *fb, IPAddress dst, uint16_t port = TCP_PORT) {
   const size_t HDR   = 12;
   const size_t CHUNK = 1400 - HDR;     // 单报文净荷, 避开 MTU 分片
   const uint8_t *buf = fb->buf;
@@ -289,7 +297,7 @@ bool send_frame_udp(camera_fb_t *fb, IPAddress dst) {
     hdr[7] = (uint8_t)i;
     bool sent = false;
     for (int t = 0; t <= max_retry; t++) {
-      cam_udp.beginPacket(dst, TCP_PORT);
+      cam_udp.beginPacket(dst, port);
       cam_udp.write(hdr, HDR);
       cam_udp.write(buf + off, n);
       int rc = cam_udp.endPacket();
@@ -476,6 +484,16 @@ void sender_task(void *arg) {
           }
         }
         if (ok) record_sent(t.len);
+      } else if (g_p2p_active) {
+        // P2P 直连已建立: 视频经 UDP 直发对端(观众), 不再走中继
+        if (g_udp_backoff_frames > 0) {
+          g_udp_backoff_frames--;
+          g_diag_skip_frames++;
+        } else if (send_frame_udp(&shim, g_p2p_peer_ip, g_p2p_peer_port)) {
+          record_sent(t.len);
+        } else {
+          g_diag_skip_frames++;
+        }
       } else if (g_relay_viewer) {
         // 无本地客户端但有观众经中继在观看 -> 整帧(含 FRAME 头)上行到中继
         if (send_frame_relay(&shim)) record_sent(t.len);
@@ -664,6 +682,40 @@ void relay_send_payload(const uint8_t *data, size_t len) {
   xSemaphoreGive(g_relay_tx);
 }
 
+// P2P 打洞: 向对端公网端点发包, 并检测对端回包(打洞成功则置 g_p2p_active)。
+void p2p_punch() {
+  if (g_p2p_peer_port == 0) return;
+  // 向对端发打洞包(内容任意, 目的让双方 NAT 建立映射)
+  cam_udp.beginPacket(g_p2p_peer_ip, g_p2p_peer_port);
+  cam_udp.write((const uint8_t *)"P2P", 3);
+  cam_udp.endPacket();
+  // 检测对端回包: 收到来自对端 IP 的 UDP 包 => 打洞成功
+  int n = cam_udp.parsePacket();
+  if (n > 0) {
+    IPAddress src = cam_udp.remoteIP();
+    if (src == g_p2p_peer_ip) {
+      g_p2p_active = true;
+      Dbg.printf("[P2P] 打洞成功, 直连 %s:%u\n",
+                 g_p2p_peer_ip.toString().c_str(), g_p2p_peer_port);
+    }
+  }
+}
+
+// 向服务器 UDP STUN 端口上报自身公网端点(打洞辅助)。服务器据此撮合双方。
+void p2p_stun() {
+  if (g_relay_host[0] == 0) return;
+  char h[64] = {0}; int port = 8000;
+  sscanf(g_relay_host, "%63[^:]:%d", h, &port);
+  IPAddress srv;
+  if (!srv.fromString(h)) return;
+  cam_udp.beginPacket(srv, port + 1);   // UDP STUN 端口 = 中继 TCP 端口 + 1
+  char msg[96];
+  int n = snprintf(msg, sizeof(msg), "{\"t\":\"stun\",\"id\":\"%s\",\"role\":\"cam\"}",
+                   g_dev_id);
+  cam_udp.write((const uint8_t*)msg, n);
+  cam_udp.endPacket();
+}
+
 // 中继: 读一条完整消息; 返回 false 表示断连/出错。
 bool relay_read_msg() {
   relay_cli.setTimeout(1500);
@@ -680,6 +732,25 @@ bool relay_read_msg() {
     memcpy(s, buf, cn); s[cn] = 0;
     if      (strstr(s, "viewer_attached")) g_relay_viewer = true;
     else if (strstr(s, "viewer_left"))     g_relay_viewer = false;
+    else if (strstr(s, "p2p_peer")) {
+      // {"t":"p2p_peer","ip":"x.x.x.x","port":N} -> 对端(观众)公网端点
+      char *ip = strstr(s, "\"ip\":\"");
+      char *pt = strstr(s, "\"port\":");
+      if (ip && pt) {
+        ip += 6;
+        char ipbuf[32]; int k = 0;
+        while (*ip && *ip != '"' && k < 31) ipbuf[k++] = *ip++;
+        ipbuf[k] = 0;
+        int p = atoi(pt + 7);
+        if (p > 0 && p < 65536 && g_p2p_peer_ip.fromString(ipbuf)) {
+          g_p2p_peer_port = (uint16_t)p;
+          g_p2p_active = false;
+          g_p2p_punch_ms = millis();
+          g_p2p_punch_start = millis();
+          Dbg.printf("[P2P] 对端 %s:%d, 开始打洞\n", ipbuf, p);
+        }
+      }
+    }
     // 其余 JSON(reg_ok/error)忽略
   } else if (ok && buf[0] != '{') {
     // 非 JSON = 观众下行命令, 作为字节流喂给命令处理器
@@ -710,6 +781,7 @@ void relay_task(void *arg) {
                g_dev_id, g_dev_name);
       relay_send_payload((const uint8_t*)reg, strlen(reg));
       Dbg.printf("[中继] 已注册 id=%s\n", g_dev_id);
+      p2p_stun();   // 上报自身 UDP 公网端点, 供服务器 P2P 撮合
       bool conn = true;
       while (conn) {
         if (relay_cli.available()) {
@@ -720,12 +792,25 @@ void relay_task(void *arg) {
             relay_send_payload((const uint8_t*)"{\"t\":\"hb\"}", 10);
             last_hb = now;
           }
+          // P2P 打洞: 有对端但未建立时周期性发包; 超时(5s)放弃保持中继
+          if (g_p2p_peer_port != 0 && !g_p2p_active) {
+            if (now - g_p2p_punch_ms >= 100) {
+              p2p_punch();
+              g_p2p_punch_ms = now;
+              if (now - g_p2p_punch_start >= 5000) {
+                Dbg.println("[P2P] 打洞超时, 保持中继");
+                g_p2p_peer_port = 0;
+              }
+            }
+          }
           if (!relay_cli.connected()) conn = false;
           if (conn) delay(10);
         }
       }
       g_relay_online = false;
       g_relay_viewer = false;
+      g_p2p_active = false;
+      g_p2p_peer_port = 0;
       Dbg.println("[中继] 连接断开");
       relay_cli.stop();
     } else {
