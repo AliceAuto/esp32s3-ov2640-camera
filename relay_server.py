@@ -64,6 +64,9 @@ class Conn:
         # 使慢观众只影响自己, 不会把阻塞反压到摄像头
         self.out_q = queue.Queue(maxsize=VIDEO_QUEUE_MAX)
         self.out_alive = True
+        self.name = None              # 显示名(来自 reg 消息)
+        self.since = 0                # 注册时间戳
+        self.bytes_relayed = 0        # 累计转发字节数(监控用)
 
     def start_out(self):
         threading.Thread(target=self._out_loop, daemon=True).start()
@@ -75,6 +78,7 @@ class Conn:
                 break
             try:
                 self.sock.sendall(len(item).to_bytes(4, "big") + item)
+                self.bytes_relayed += len(item) + 4
             except OSError:
                 self.close()
                 break
@@ -178,6 +182,8 @@ class Server:
             c.device_id = msg.get("id") or f"cam-{c.addr[1]}"
             c.is_camera = True
             name = msg.get("name") or c.device_id
+            c.name = name
+            c.since = time.time()
             with self.lock:
                 self.devices[c.device_id] = c
             self.log(f"设备注册: {c.device_id} name={name} from {c.addr}")
@@ -190,9 +196,9 @@ class Server:
             now = time.time()
             with self.lock:
                 devs = [{"id": d.device_id,
-                         "name": d.device_id,
+                         "name": d.name or d.device_id,
                          "online": bool(d.running),
-                         "since": int(now)} for d in self.devices.values()]
+                         "since": int(d.since or now)} for d in self.devices.values()]
             c.send_json({"t": "devices", "devices": devs})
         elif t == "watch":
             if c.is_camera:
@@ -343,10 +349,12 @@ class Server:
                     with srv_ref.lock:
                         n_devs = len(srv_ref.devices)
                         n_relays = sum(1 for d in srv_ref.devices.values() if d.peer is not None)
+                        total_bytes = sum(d.bytes_relayed for d in srv_ref.devices.values())
                     with srv_ref.udp_lock:
                         n_eps = len(srv_ref.udp_endpoints)
                     body = json.dumps({"devices": n_devs, "active_relays": n_relays,
-                                       "udp_endpoints": n_eps}).encode()
+                                       "udp_endpoints": n_eps,
+                                       "bytes_relayed": total_bytes}).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()

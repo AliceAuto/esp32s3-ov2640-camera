@@ -1311,7 +1311,17 @@ void adapt_quality() {
   // 与 README 描述不符。改为按分辨率选目标帧率; 下限保留 8(QVGA/CIF 模式下
   // quality 过低会触发传感器编码卡死无帧, 见 g_quality 初始化注释)。
   uint32_t now = millis();
-  if (g_adapt_last_ms == 0 || now - g_adapt_last_ms < 2500) return;
+  // 首次调用: 设基线后直接返回, 等下一个采样窗再评估。
+  // 原实现 g_adapt_last_ms==0 时 return 但基线设置在函数末尾(return 之后),
+  // 导致 g_adapt_last_ms 永远为 0, adapt_quality 实际从未生效。
+  if (g_adapt_last_ms == 0) {
+    g_adapt_last_ms    = now;
+    g_adapt_last_sent  = g_adapt_total_frames;
+    g_adapt_last_bytes = g_adapt_total_bytes;
+    g_adapt_last_err   = g_adapt_total_err;
+    return;
+  }
+  if (now - g_adapt_last_ms < 2500) return;
 
   float dt = (now - g_adapt_last_ms) / 1000.0f;
   uint32_t sent_delta = (uint32_t)(g_adapt_total_frames - g_adapt_last_sent);
