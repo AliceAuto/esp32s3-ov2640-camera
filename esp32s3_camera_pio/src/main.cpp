@@ -582,8 +582,10 @@ void setup() {
   // 放核0 让它和采集(DMA中断)抢的同时彻底不碰 loopTask(核1) 的控制响应。
   xTaskCreatePinnedToCore(sender_task, "tx", 4096, NULL, 3, NULL, 0);
   g_relay_tx = xSemaphoreCreateMutex();
-  xTaskCreate(disc_task,  "disc",  2048, NULL, 1, NULL);   // 局域网自动发现广播
-  xTaskCreate(relay_task, "relay", 3072, NULL, 1, NULL);   // 跨网中继客户端(常驻在线)
+  // 网络型任务统一 pin 核0(与 WiFi/lwIP 协议栈同核): relay 常驻收发/可能等待,
+  // 若放核1 会抢走 loopTask 的采集与命令实时性。核1 只留给采集+控制, 最大化双核并行。
+  xTaskCreatePinnedToCore(disc_task,  "disc",  2048, NULL, 1, NULL, 0); // 局域网发现广播
+  xTaskCreatePinnedToCore(relay_task, "relay", 3072, NULL, 1, NULL, 0); // 跨网中继(常驻)
   g_diag_last_ms = millis();
   g_adapt_last_ms = millis();
 #endif
