@@ -196,8 +196,9 @@ static const char FRAME_END[]   = "FRAME_END\n";
 static framesize_t PREVIEW_FRAME = FRAMESIZE_QVGA;   // 预览 320x240（30fps，OV2640 CIF 模式甜点）
 static framesize_t HI_FRAME      = FRAMESIZE_UXGA;   // 拍照 1600x1200
 static framesize_t cur_frame     = FRAMESIZE_QVGA;
-static int         g_quality     = 10;   // JPEG 质量(0-63, 越小画质越高文件越大).
-// 注意: QVGA(CIF模式)下 quality 太低(如2)会卡死无帧(传感器编码bug), 默认10最稳(30fps).
+static int         g_quality     = 16;   // JPEG 质量(0-63, 值越大压缩越强文件越小).
+// 帧率优先策略: 默认升至16在 QVGA 下每帧量约减半, 跨网带宽受限时帧率近翻倍, QVGA画质损失轻微。
+// 注意: QVGA(CIF模式)下 quality 太低(如2)会卡死无帧(传感器编码bug), 16 在此安全区间内且比10更抗带宽。
 //       VGA(SVGA模式)下可运行时 'q2' 提画质(实测 15fps + 55KB/帧) 不损失帧率.
 
 // 摄像头配置全局保存，供失锁后 deinit+reinit 复用
