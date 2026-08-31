@@ -28,7 +28,10 @@ OV2640 跨网信令 + 中继服务端。
   SRV  -> VIEWER: {"t":"watch_ok"}  或 {"t":"error","msg":"..."}
   SRV  -> CAM:   {"t":"viewer_attached"}      (有观众接入, CAM 开始推流)
   SRV  -> CAM:   {"t":"viewer_left"}
+  SRV  -> CAM:   {"t":"p2p_peer","ip","port"} (对端观众公网端点, 供 UDP 打洞直连)
+  SRV  -> VIEWER:{"t":"p2p_peer","ip","port"} (对端摄像头公网端点, 供 UDP 打洞直连)
   之后 CAM/VIEWER 之间发起的非 JSON 字节将双向透传(见上)。
+  P2P 直连为"尽力而为": 打洞成功则视频改走 UDP 直连, 失败仍走本中继(TCP)。
 
 用法:  python relay_server.py [port]
 默认端口 8000。需在云服务器防火墙/安全组放行 TCP 8000。
@@ -84,6 +87,11 @@ class Server:
         self.port = port
         self.devices = OrderedDict()   # id -> Conn
         self.lock = threading.Lock()
+        # P2P 打洞辅助: UDP STUN 端口(默认 port+1), 记录各端 UDP 公网端点。
+        # 键: 摄像头用 "cam:<id>", 观众用 "viewer:<cam_id>"。
+        self.udp_port = port + 1
+        self.udp_endpoints = {}        # key -> (ip, port)
+        self.udp_lock = threading.Lock()
 
     def detach(self, conn):
         """连接关闭时: 解除设备注册、断开中继对端。"""
@@ -161,7 +169,14 @@ class Server:
             c.peer = cam
             cam.send_json({"t": "viewer_attached"})
             c.send_json({"t": "watch_ok"})
-            self.log(f"观众 {c.addr} 观看 {target_id}")
+            # P2P 撮合: 把对端 UDP 公网端点(STUN 上报)下发给双方, 供 UDP 打洞直连。
+            # 未上报则退回对端 TCP 公网端点(尽力而为)。打洞失败仍走本中继(TCP)。
+            with self.udp_lock:
+                cam_ep = self.udp_endpoints.get(f"cam:{target_id}") or (cam.addr[0], cam.addr[1])
+                view_ep = self.udp_endpoints.get(f"viewer:{target_id}") or (c.addr[0], c.addr[1])
+            cam.send_json({"t": "p2p_peer", "ip": view_ep[0], "port": view_ep[1]})
+            c.send_json({"t": "p2p_peer", "ip": cam_ep[0], "port": cam_ep[1]})
+            self.log(f"观众 {c.addr} 观看 {target_id} (p2p_peer 已下发)")
 
     def _recv_exact(self, c: Conn, n: int):
         """读满 n 字节; 返回空 bytes 表示连接已关闭/出错。"""
@@ -199,12 +214,43 @@ class Server:
             c = Conn(sock, addr, self)
             threading.Thread(target=self.handle, args=(c,), daemon=True).start()
 
+    def udp_stun_loop(self):
+        """UDP STUN 辅助: 接收各端打洞前的公网端点上报, 记录并回显。
+        数据报: {"t":"stun","id":"<cam_id>","role":"cam|viewer"}。"""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", self.udp_port))
+        self.log(f"UDP STUN 监听 0.0.0.0:{self.udp_port} (放行 UDP {self.udp_port})")
+        while True:
+            try:
+                data, addr = s.recvfrom(2048)
+            except OSError:
+                continue
+            try:
+                msg = json.loads(data.decode("utf-8", "ignore"))
+            except Exception:
+                continue
+            if msg.get("t") != "stun":
+                continue
+            cam_id = msg.get("id") or ""
+            role = msg.get("role") or "cam"
+            key = f"cam:{cam_id}" if role == "cam" else f"viewer:{cam_id}"
+            with self.udp_lock:
+                self.udp_endpoints[key] = (addr[0], addr[1])
+            self.log(f"STUN {role} {cam_id}: {addr[0]}:{addr[1]}")
+            try:
+                s.sendto(json.dumps({"t": "stun_ok", "ip": addr[0], "port": addr[1]}).encode(),
+                         addr)
+            except OSError:
+                pass
+
     def serve(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("0.0.0.0", self.port))
         listener.listen(32)
         self.log(f"relay_server 监听 0.0.0.0:{self.port} (放行 TCP {self.port})")
+        threading.Thread(target=self.udp_stun_loop, daemon=True).start()
         try:
             self.accept_loop(listener)
         except KeyboardInterrupt:
