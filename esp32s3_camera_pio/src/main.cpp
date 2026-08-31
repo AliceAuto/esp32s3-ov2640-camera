@@ -57,8 +57,10 @@ void handle_web_save();
 void disc_task(void *arg);
 void relay_task(void *arg);
 bool send_frame_relay(camera_fb_t *fb);
+bool send_frame_udp_via_turn(camera_fb_t *fb);
 void p2p_punch();
-void p2p_stun();
+void ice_poll();
+void turn_keepalive();
 String default_dev_id();
 
 // UART0 = CH343 转串口所在通道（TX=GPIO43, RX=GPIO44），避免默认 Serial 走 USB-CDC。
@@ -126,6 +128,8 @@ static volatile uint16_t g_p2p_peer_port = 0;    // P2P 对端公网端口(0=未
 static volatile bool g_p2p_active = false;       // P2P 直连已建立(视频走 UDP 直连)
 static uint32_t      g_p2p_punch_ms = 0;         // 上次打洞发包时间
 static uint32_t      g_p2p_punch_start = 0;      // 打洞开始时间(超时放弃用)
+static volatile bool g_turn_mode    = false;     // 打洞超时已切换 TURN 兜底(帧经服务器转向观众)
+static uint32_t      g_turn_last_stun = 0;       // 上次 STUN 保活刷新时间
 
 // 中继链路收到的一整条命令数据; 用轻量 Stream 喂给 handle_cmd
 class ByteStream : public Stream {
@@ -494,6 +498,16 @@ void sender_task(void *arg) {
         } else {
           g_diag_skip_frames++;
         }
+      } else if (g_turn_mode) {
+        // 打洞失败, TURN 兜底: 帧经服务端 UDP 转向观众(不依赖 NAT 类型, 必达)
+        if (g_udp_backoff_frames > 0) {
+          g_udp_backoff_frames--;
+          g_diag_skip_frames++;
+        } else if (send_frame_udp_via_turn(&shim)) {
+          record_sent(t.len);
+        } else {
+          g_diag_skip_frames++;
+        }
       } else if (g_relay_viewer) {
         // 无本地客户端但有观众经中继在观看 -> 整帧(含 FRAME 头)上行到中继
         if (send_frame_relay(&shim)) record_sent(t.len);
@@ -716,6 +730,21 @@ void p2p_stun() {
   cam_udp.endPacket();
 }
 
+// ICE 候选刷新: 周期上报 STUN, 保持服务器上 cam 的 server-reflexive 候选新鲜。
+// host 候选 = WiFi.localIP(建连即固定), relayed 候选 = 服务器转发的映射。
+void turn_keepalive() {
+  if (!g_relay_online) return;
+  uint32_t now = millis();
+  if (now - g_turn_last_stun < 15000) return;   // 15s 一次即可维持 NAT 映射
+  g_turn_last_stun = now;
+  p2p_stun();                                   // 服务器按 STUN 刷新 cam 端点
+}
+void ice_poll() {
+  // 三层候选协商中的轮询: 主要工作是保活刷新 server-reflexive 候选。
+  // 打洞阶段与 TURN 兜底阶段都依赖该候选的新鲜度, 统一由 turn_keepalive 维护。
+  turn_keepalive();
+}
+
 // 中继: 读一条完整消息; 返回 false 表示断连/出错。
 bool relay_read_msg() {
   relay_cli.setTimeout(1500);
@@ -792,17 +821,21 @@ void relay_task(void *arg) {
             relay_send_payload((const uint8_t*)"{\"t\":\"hb\"}", 10);
             last_hb = now;
           }
-          // P2P 打洞: 有对端但未建立时周期性发包; 超时(5s)放弃保持中继
+          // P2P 打洞: 有对端但未建立时周期性发包; 超时(5s)放弃, 切换 TURN 兜底
           if (g_p2p_peer_port != 0 && !g_p2p_active) {
             if (now - g_p2p_punch_ms >= 100) {
               p2p_punch();
               g_p2p_punch_ms = now;
               if (now - g_p2p_punch_start >= 5000) {
-                Dbg.println("[P2P] 打洞超时, 保持中继");
+                Dbg.println("[P2P] 打洞超时, 切换 TURN 兜底");
                 g_p2p_peer_port = 0;
+                g_turn_mode = true;          // 帧走 send_frame_udp_via_turn
+                g_turn_last_stun = now;
               }
             }
           }
+          // ICE 候选刷新/TURN 保活: 维持服务器上 cam 的反射映射, 对称 NAT 也能收到转向
+          ice_poll();
           if (!relay_cli.connected()) conn = false;
           if (conn) delay(10);
         }
@@ -811,6 +844,7 @@ void relay_task(void *arg) {
       g_relay_viewer = false;
       g_p2p_active = false;
       g_p2p_peer_port = 0;
+      g_turn_mode = false;
       Dbg.println("[中继] 连接断开");
       relay_cli.stop();
     } else {
@@ -838,6 +872,70 @@ bool send_frame_relay(camera_fb_t *fb) {
   relay_send_payload(blob, total);
   heap_caps_free(blob);
   return true;
+}
+
+// TURN 兜底发送一帧: 复用 OVU 分片布局, 但每片套上 "C2V" 信封发往服务器 UDP TURN 端口。
+// 服务器把 payload(即完整 OVU 数据报)转向观众的真实公网端点 —— 不依赖 NAT 类型, 对称 NAT 也能必达。
+// 信封: magic(3) "C2V" + cam_id_len(4, 大端) + cam_id + OVU 数据报。
+bool send_frame_udp_via_turn(camera_fb_t *fb) {
+  if (g_relay_host[0] == 0 || !g_relay_online) return false;
+  char h[64] = {0}; int port = 8000;
+  sscanf(g_relay_host, "%63[^:]:%d", h, &port);
+  IPAddress srv;
+  if (!srv.fromString(h)) return false;
+  if (port + 1 > 65535) return false;
+
+  const char *cid = g_dev_id;
+  size_t cid_len = strlen(cid);
+  if (cid_len == 0) return false;
+
+  // 与 send_frame_udp 相同的 OVU 分片(观众端复用现有 UDP 重组逻辑)
+  const size_t HDR = 12;
+  const size_t CHUNK = 1400 - HDR;
+  const uint8_t *buf = fb->buf;
+  size_t len = fb->len;
+  size_t nchunk = (len + CHUNK - 1) / CHUNK;
+  if (nchunk > 250) nchunk = 250;
+
+  uint8_t hdr[HDR];
+  hdr[0] = 'O'; hdr[1] = 'V'; hdr[2] = 'U';
+  hdr[3] = (fb->format == PIXFORMAT_JPEG) ? 1 : 0;
+  hdr[4] = (uint8_t)(udp_seq >> 8);
+  hdr[5] = (uint8_t)(udp_seq & 0xFF);
+  hdr[6] = (uint8_t)(nchunk - 1);
+  hdr[8]  = (uint8_t)(fb->width >> 8);
+  hdr[9]  = (uint8_t)(fb->width & 0xFF);
+  hdr[10] = (uint8_t)(fb->height >> 8);
+  hdr[11] = (uint8_t)(fb->height & 0xFF);
+
+  // 信封固定头: magic(3) + cam_id_len(4, 大端)
+  uint8_t env_head[7] = {
+    'C', '2', 'V',
+    (uint8_t)(cid_len >> 24), (uint8_t)(cid_len >> 16),
+    (uint8_t)(cid_len >> 8),  (uint8_t)cid_len
+  };
+
+  bool allok = true;
+  size_t off = 0;
+  for (size_t i = 0; i < nchunk && off < len; i++) {
+    size_t n = len - off;
+    if (n > CHUNK) n = CHUNK;
+    hdr[7] = (uint8_t)i;
+    cam_udp.beginPacket(srv, port + 1);
+    cam_udp.write(env_head, 7);
+    cam_udp.write((const uint8_t*)cid, cid_len);
+    cam_udp.write(hdr, HDR);
+    cam_udp.write(buf + off, n);
+    int rc = cam_udp.endPacket();
+    if (rc != 1) {
+      allok = false;
+      if (nchunk > 4) g_udp_backoff_frames = 3;   // 大帧失败退避, 别冲爆 TX 队列
+      break;
+    }
+    off += n;
+  }
+  if (allok) udp_seq++;
+  return allok;
 }
 
 void setup_wifi() {

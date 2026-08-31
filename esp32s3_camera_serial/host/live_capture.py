@@ -301,6 +301,7 @@ class RelayIo:
         peer = self._p2p_peer
         punch = json.dumps({"t": "punch"}).encode()
         last_punch = 0.0
+        last_stun = 0.0
         while not self._p2p_stop.is_set():
             now = time.time()
             # 打洞包: 前 2s 每 100ms 一发, 之后每 500ms 保活
@@ -310,6 +311,11 @@ class RelayIo:
                 except OSError:
                     pass
                 last_punch = now
+            # STUN 周期保活: 维持服务器上本端(viewer)的反射端点。
+            # 摄像头打洞失败切 TURN 后, 帧由服务器转向本端点; 端点过期则收不到。
+            if now - last_stun >= 10.0:
+                self._send_stun(self.cam_id)
+                last_stun = now
             try:
                 pkt, _ = s.recvfrom(2048)
             except socket.timeout:
