@@ -583,6 +583,22 @@ bool camera_reconnect() {
 // 真正的分辨率切换：deinit + init 全量重配，失败自动回退
 bool camera_change_framesize(framesize_t fs) {
   if (fs == cur_frame) { return true; }
+  // 快路径: 同为 CIF 系小图(≤QVGA 320x240)、fb_count 均为 2 时, 缓冲区在开机按大图
+  // 已分配、足以容纳两者(含 QCIF/HQVGA 等)。用寄存器级 set_framesize 毫秒切换,
+  // 避开 deinit+init 全量重建造成的 ~0.5-1s 黑屏/冻结。
+  // 必须避开 VGA(触发库 EV-VSYNC-OVF 死循环 bug)与 SVGA/XGA/UXGA(fb_count=1,
+  // 必须重分配缓冲) —— 这些仍走下方慢路径。
+  if (fs <= FRAMESIZE_QVGA && cur_frame <= FRAMESIZE_QVGA
+      && fb_count_for(fs) == 2 && fb_count_for(cur_frame) == 2) {
+    sensor_t *s = esp_camera_sensor_get();
+    if (s && s->set_framesize(s, fs) == 0) {
+      cur_frame = fs;
+      g_config.frame_size = fs;
+      Dbg.printf("预览分辨率快速切换: fs=%d\n", (int)fs);
+      return true;
+    }
+    Dbg.println("快速切换失败 -> 回退全量重建");
+  }
 #ifdef ENABLE_WIFI
   g_switching = true;
   wait_tx_idle(500);            // 大分辨率下最后一帧可能近100ms, 留足排空时间
