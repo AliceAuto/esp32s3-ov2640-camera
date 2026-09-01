@@ -54,6 +54,15 @@ VIDEO_QUEUE_MAX = 8
 # 打洞时交叉探测 N x M 个组合 —— 单候选对端口受限/对称 NAT 基本打不通。
 P2P_MAX_CANDS = 4
 
+# UDP 端点活性(TTL, 秒): 端点带 seen 时间戳, 周期性清扫超时端点。
+# 关键: 观众/摄像头断开后不再发 STUN 刷新, 其端点会自然过期消失,
+# 从而根治"历史 P2P 端点污染"—— 纯 TCP 观众 watch 时不会被旧端点带进打洞/TURN。
+#   P2P_EP_TTL       > 各端 STUN 周期(观众 10s / 固件 15s 保活刷新), 留余量避免误删;
+#   P2P_EP_FRESH     < = match_p2p 判定"当前观众是否已就绪 UDP 端点"的窗口,
+#                      只有最近 FRESH 秒内刷新过端点的观众才下发 viewer_udp。
+P2P_EP_TTL = 25
+P2P_EP_FRESH = 12
+
 # ---------------------------------------------------------------------------
 # 连接对象: 持有 socket + 身份(device / viewer) + 转发对端
 # ---------------------------------------------------------------------------
@@ -167,7 +176,7 @@ class Server:
         # P2P 打洞辅助: UDP STUN 端口(默认 port+1), 记录各端 UDP 公网端点。
         # 键: 摄像头用 "cam:<id>", 观众用 "viewer:<cam_id>"。
         self.udp_port = port + 1
-        self.udp_endpoints = {}        # key -> (ip, port)
+        self.udp_endpoints = {}        # key -> [(ip, port, seen_ts)] (随连接清理)
         self.udp_lock = threading.Lock()
 
     def detach(self, conn):
@@ -186,6 +195,14 @@ class Server:
             # 对端若是观众, 直接断开; 是摄像头则保留等下一个观众
             if not peer.is_camera:
                 peer.close()
+        # 观众(或摄像头)断开 -> 立即撤销其对应 UDP 候选端点, 不让"已走的观众"遗留
+        # 端点把后续纯 TCP 观众带进 P2P/TURN。配 TTL 清扫双保险根除历史污染。
+        if conn.is_camera and conn.device_id:
+            with self.udp_lock:
+                self.udp_endpoints.pop(f"cam:{conn.device_id}", None)
+        elif peer is not None and peer.is_camera and peer.device_id:
+            with self.udp_lock:
+                self.udp_endpoints.pop(f"viewer:{peer.device_id}", None)
 
     def log(self, msg):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -279,15 +296,17 @@ class Server:
           同时保留 ip/port=主候选, 旧固件/旧观众仍可按单候选工作。
         - 观众没有任何 UDP 候选时不下发 p2p_peer: 此前用 TCP 公网端点兜底,
           但 TCP 端口与 UDP 映射无关, 打洞必失败还白耗 3s 打洞窗口。
+        - 只信任"新鲜"端点(最近 P2P_EP_FRESH 秒内有 STUN 保活): 摄像头/观众一旦
+          断开就不再发 STUN, 其端点过期即视为失效, 不再把别的观众带进打洞/TURN,
+          根治历史端点污染。
         - 摄像头收到 viewer_udp 信令后视频立即走 TURN(不等打洞结果)。
         """
         with self.udp_lock:
-            cam_cands = [f"{ip}:{port}" for ip, port in
-                         (self.udp_endpoints.get(f"cam:{target_id}") or [])]
-            view_cands = [f"{ip}:{port}" for ip, port in
-                          (self.udp_endpoints.get(f"viewer:{target_id}") or [])]
+            now = time.time()
+            cam_cands = self._fresh_cands(f"cam:{target_id}", now)
+            view_cands = self._fresh_cands(f"viewer:{target_id}", now)
         if not cam_cands and not view_cands:
-            self.log(f"撮合跳过({why}): 双方均无 UDP 候选")
+            self.log(f"撮合跳过({why}): 双方均无活跃 UDP 候选")
             return
         if view_cands:
             cam.send_json({"t": "p2p_peer", "ip": view_cands[0].split(":")[0],
@@ -297,11 +316,32 @@ class Server:
             viewer.send_json({"t": "p2p_peer", "ip": cam_cands[0].split(":")[0],
                               "port": int(cam_cands[0].rsplit(":", 1)[1]),
                               "cands": cam_cands})
-        # 观众有 UDP 候选 -> 摄像头视频直接走 TURN UDP, 不必先经过数秒 TCP 中继。
+        # 观众有活跃 UDP 候选 -> 摄像头视频直接走 TURN UDP, 不必先经过数秒 TCP 中继。
         # TCP 中继是队头阻塞的, 跨网帧率会被单帧 RTT 卡住。
         if view_cands:
             cam.send_json({"t": "viewer_udp"})
         self.log(f"撮合({why}) cam_cands={len(cam_cands)} view_cands={len(view_cands)}")
+
+    def _fresh_cands(self, key, now):
+        """取某 key 的活跃端点列表("ip:port"); 只保留最近 P2P_EP_FRESH 秒刷新过的。
+        端点内部格式: (ip, port, seen_ts)。"""
+        out = []
+        for ep in (self.udp_endpoints.get(key) or []):
+            ip, port, seen = ep
+            if now - seen <= P2P_EP_FRESH:
+                out.append(f"{ip}:{port}")
+        return out
+
+    def _sweep_udp_endpoints(self):
+        """清扫超时端点: 任何端点在 P2P_EP_TTL 秒内都没被 STUN 刷新则整 key 删除。
+        设备/观众断开即停止刷新 -> 端点随连接消失, 杜绝历史污染。"""
+        with self.udp_lock:
+            stale = [k for k, lst in self.udp_endpoints.items()
+                     if lst and time.time() - lst[-1][2] > P2P_EP_TTL]
+            for k in stale:
+                del self.udp_endpoints[k]
+        if stale:
+            self.log(f"清理过期 UDP 端点: {', '.join(stale)}")
 
     def _recv_exact(self, c: Conn, n: int):
         """读满 n 字节; 返回空 bytes 表示连接已关闭/出错。"""
@@ -371,11 +411,17 @@ class Server:
                     key = f"cam:{cam_id}" if role == "cam" else f"viewer:{cam_id}"
                     with self.udp_lock:
                         # 可靠 P2P: 每端开多个候选 socket, 各自发一次 STUN。
-                        # 端点累积成列表(去重, 滚动保留最新 P2P_MAX_CANDS 个),
-                        # 打洞时交叉探测全部组合, 大幅提高受限/对称 NAT 的打通率。
+                        # 端点累积成列表(去重, 滚动保留最新 P2P_MAX_CANDS 个), 打洞时
+                        # 交叉探测全部组合, 大幅提高受限/对称 NAT 的打通率。
+                        # 存储格式 (ip, port, seen_ts): 每次 STUN 都刷新 seen_ts,
+                        # 作为"随连接清理"的活性判据(断开即不再刷新 -> 过期删除)。
                         lst = self.udp_endpoints.setdefault(key, [])
-                        if (addr[0], addr[1]) not in lst:
-                            lst.append((addr[0], addr[1]))
+                        for i, ep in enumerate(lst):
+                            if ep[0] == addr[0] and ep[1] == addr[1]:
+                                lst[i] = (addr[0], addr[1], time.time())
+                                break
+                        else:
+                            lst.append((addr[0], addr[1], time.time()))
                         while len(lst) > P2P_MAX_CANDS:
                             lst.pop(0)
                     self.log(f"STUN {role} {cam_id}: {addr[0]}:{addr[1]} (cands={len(lst)})")
@@ -405,7 +451,7 @@ class Server:
                     # 都在收, 重组按 (seq,idx) 去重, 冗余包无害; 任一映射仍有效即可达。
                     for t_ep in targets:
                         try:
-                            s.sendto(payload, t_ep)
+                            s.sendto(payload, t_ep[:2])   # (ip, port, seen_ts) -> (ip, port)
                         except OSError:
                             pass
                     self.log(f"TURN {magic.decode()} cam={cam_id} -> x{len(targets)} {len(payload)}B")
@@ -413,6 +459,16 @@ class Server:
                     self.log(f"TURN 无对端端点 cam={cam_id} dir={magic.decode()}")
                 continue
             # 忽略其他
+
+    def ep_sweep_loop(self):
+        """周期清扫过期 UDP 端点(每 P2P_EP_TTL 秒一次)。
+        摄像头/观众断开后不再发 STUN 刷新, 端点到期即被删除 -> 随连接清理, 根治历史污染。"""
+        while True:
+            time.sleep(P2P_EP_TTL)
+            try:
+                self._sweep_udp_endpoints()
+            except Exception:
+                traceback.print_exc()
 
     def status_loop(self):
         """简单 HTTP /status 端点: 返回在线设备数、活跃中继对数、UDP 端点数。"""
@@ -454,6 +510,7 @@ class Server:
         self.log(f"relay_server 监听 0.0.0.0:{self.port} (放行 TCP {self.port})")
         threading.Thread(target=self.udp_stun_loop, daemon=True).start()
         threading.Thread(target=self.status_loop, daemon=True).start()
+        threading.Thread(target=self.ep_sweep_loop, daemon=True).start()
         try:
             self.accept_loop(listener)
         except KeyboardInterrupt:
