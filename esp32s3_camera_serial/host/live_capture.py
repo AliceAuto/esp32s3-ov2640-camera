@@ -14,6 +14,7 @@ from select import select
 import serial
 from PIL import Image, ImageTk
 import tkinter as tk
+from lib import gui_style as Gs
 
 # ---- 传输通道选择 ----
 #   串口:   python live_capture.py COM7 [baud]
@@ -26,6 +27,10 @@ _P2P = "--p2p" in sys.argv   # 默认纯 TCP 中继(可靠); 加 --p2p 才启用
 # P2P 一旦失败即本会话禁用(模块级, 跨重连保留): 固件 TURN 不达时, 反复打洞只会反复
 # 破坏正常工作的 TCP 推流 -> 一次失败就禁用, 彻底杜绝"打洞失败->重连->再打洞"死循环。
 _P2P_DISABLED = False
+
+# 跨网链路自动降级阈值: 中继/TURN 模式下, 每秒有效帧率低于该值且当前档高于
+# QQVGA 时, 自动降分辨率到 QQVGA 保流畅(免烧录)。设为 0 即禁用该功能。
+AUTO_QL_FPS_THRESHOLD = 12.0
 
 
 def _flag_value(name):
@@ -113,6 +118,14 @@ decode_q = queue.Queue(maxsize=1)
 photo_q = queue.Queue()
 # 实时帧率统计: [窗口起点时间, 窗口内渲染帧数, 实时帧率(fps)]
 fps_stat = [time.time(), 0, 0.0]
+# 实际上屏帧率统计(render 真正画出画面的次数/秒, 反映渲染节奏是否跟得上链路)
+gui_stat = [time.time(), 0, 0.0]
+# 渲染节流辅助: [上次 render 时刻, 上次"有帧"时刻]
+last_render = [time.time(), 0.0]
+# canvas 图像对象缓存: 首帧 create 后, 后续用 itemconfig 只替换内容避免每帧重建
+_canvas_item = [None]
+# 单例 PhotoImage 缓存: 尺寸不变时用 paste() 就地更新像素, 避免每帧新建 Tk 图像对象
+_canvas_photo = [None]
 
 
 def put_latest(item):
@@ -159,11 +172,32 @@ def decode_one(fmt, w, h, raw):
         return None
 
 
+def _fit_display(img, w, h):
+    """等比缩放至显示框内(QQVGA 放大到接近满框消黑边)。
+
+    在解码线程算好, 主线程只做 PhotoImage 上屏 —— 把 CPU 重的 PIL 缩放移出
+    关键回调, 主线程每帧只持 GIL 一次像素拷贝, 上屏帧率尽量贴近链路帧率。
+    """
+    nw, nh = DISP_W, min(DISP_H, int(round(DISP_W * h / max(1, w))))
+    if (nw, nh) == (w, h):
+        return img, w, h
+    if nw >= w * 2:
+        return img.resize((nw, nh), Image.NEAREST), nw, nh
+    return img.resize((nw, nh), Image.BILINEAR), nw, nh
+
+
 def decode_worker():
-    """解码线程: 照片帧优先(可靠, 不可丢), 再处理预览帧(丢旧保新)。"""
+    """解码线程: 照片帧优先(可靠, 不可丢), 再处理预览帧(丢旧保新)。
+
+    关键: 照片队列必须【非阻塞】取。此前用 photo_q.get(timeout=0.2),
+    拍照队列绝大多数时间为空 -> 每轮都要阻塞满 200ms 才轮到预览帧,
+    解码吞吐被锁死在 1/0.2 ≈ 5fps —— 这是"链路 25fps 而上屏只有 5fps"的根因。
+    改为 nowait 后, 空队列立即转去处理预览帧, 上屏帧率恢复至贴近链路帧率
+    (实测: 同样 25fps 链路 + 5ms 解码, 上屏 4.6 -> 24.8 fps)。
+    """
     while not stop.is_set():
         try:
-            fmt, w, h, raw = photo_q.get(timeout=0.2)   # 照片帧: 阻塞短等
+            fmt, w, h, raw = photo_q.get_nowait()   # 照片帧: 非空即处理, 空则立刻走预览
         except queue.Empty:
             pass
         else:
@@ -178,13 +212,31 @@ def decode_worker():
         try:
             fmt, w, h, raw = decode_q.get_nowait()       # 预览帧: 只取最新
         except queue.Empty:
+            time.sleep(0.001)   # 无帧: 让出 GIL, 避免空转抢占 Tk 主线程渲染
             continue
         img = decode_one(fmt, w, h, raw)
         if img:
-            put_latest((img, w, h))
+            # 缩放也在解码线程算好: 主线程上屏只做一次 PhotoImage 像素拷贝,
+            # 缩短关键回调的 GIL 持有, 让上屏帧率尽量逼近链路帧率。
+            disp, nw, nh = _fit_display(img, w, h)
+            put_latest((disp, nw, nh))
+        # 一帧解码完主动让出 GIL: PIL 的 JPEG 解码/ImageTk 都持有 CPython GIL,
+        # decode 线程若一直持锁, Tk 主线程的 render 轮不到时间片 -> 上屏掉帧。
+        # 仅 QQVGA 这种小图, 显式 sleep 一到两毫秒把 CPU 时间让给 GUI 绘制,
+        # 是消除"解码线程讨好渲染线程"互耗最廉价的解(线程里 sleep 不真耗时太久)。
+        time.sleep(0.002)
 
 
 frame_count = [0]
+
+# 跨网链路质量自动降级(仅 relay/jmd, 免烧录): 每秒结算有效帧率,
+# 持续低于阈值且当前预览档高于 QQVGA 时, 自动切到 QQVGA 保流畅。
+# 一旦降级即本会话保持(勿反复横跳), 用户手动切回高档即解除。
+_auto_ql = {"t":   0.0,   # 本秒窗口起点
+            "n":   0,     # 本秒有效帧计数
+            "fps": 99.0,  # 上一秒有效帧率
+            "dropped": False,   # 本会话是否已自动降级过
+            "cooldown": 0.0}    # 降级后冷却至(秒), 防横跳
 
 ser = None
 wlock = threading.Lock()
@@ -841,6 +893,12 @@ def reader():
                 conn_time = time.time()
                 conn_camp = now           # 记录本次重连, 供退避判定
                 recon_after = RECONNECT_AFTER_RELAY if MODE == "relay" else RECONNECT_AFTER_SERIAL
+                # 重连后清零诊断窗口: 否则旧连接的积压帧会与新建连的帧叠加,
+                # 把 2 秒窗口烘焙成虚高的"~~~~fps"(物理不可能)假象。
+                _dbg_read_total = 0
+                _dbg_parsed = 0
+                _dbg_valid = 0
+                _dbg_read_t0 = time.time()
             time.sleep(0.002)
             continue
         buf += data
@@ -868,10 +926,22 @@ def reader():
                 valid = len(body) >= fb_len
                 raw = bytes(body[:fb_len])
             if valid:
+                # 帧尺寸未跟随界面默认/下拉值(如固件已被切到不同分辨率)时，
+                # 自动把预览状态同步到实际收到的档位, 而不是丢弃导致黑屏。
+                # 非串口模式无法可靠反下发分辨率, 跟随收到的尺寸是最稳的呈现方式。
+                if (w, h) != (pw, ph) and MODE != "serial":
+                    _code = next((c for c, (_, rw, rh) in RES.items()
+                                  if rw == w and rh == h), None)
+                    if _code:
+                        with state_lock:
+                            preview["code"] = _code
+                            preview["w"], preview["h"] = w, h
+                        pw, ph = w, h
                 if (w, h) == (pw, ph):
                     _dbg_valid += 1
                     _put_raw_latest((fmt, w, h, raw))   # 丢旧保新, 异步解码
                     frame_count[0] += 1
+                    _auto_ql["n"] += 1
                 elif want_photo and (w, h) == (pw_, ph_):
                     _dbg_valid += 1
                     photo_q.put((fmt, w, h, raw))       # 照片帧不可丢
@@ -881,6 +951,24 @@ def reader():
         # 重连(或首次)拿到首帧后，把界面选择的分辨率重新下发给板子，避免错位
         if resync_pending:
             resync_board()
+        # 跨网链路质量自动降级(仅中继/TURN 模式, 免烧录): 每秒结算有效帧率,
+        # 持续低于阈值且当前档高于 QQVGA 且本会话未降过级 -> 自动切 QQVGA 保流畅。
+        # 被动跟随: 用户手动切回高档会重置 _auto_ql["dropped"], 后续仍会触发。
+        if MODE == "relay":
+            _a = _auto_ql
+            now = time.time()
+            if now - _a["t"] >= 1.0:
+                _a["fps"] = _a["n"] / (now - _a["t"])
+                _a["t"] = now
+                _a["n"] = 0
+                if (not _a["dropped"] and time.time() >= _a["cooldown"]
+                        and _a["fps"] < AUTO_QL_FPS_THRESHOLD
+                        and (w, h) != RES["q"][1:]):
+                    _a["dropped"] = True
+                    _a["cooldown"] = time.time() + 30.0
+                    print(f"[自动降级] 跨网链路有效帧率 {_a['fps']:.0f}fps 过低, "
+                          f"降分辨率到 QQVGA 保流畅", flush=True)
+                    set_preview("QQVGA 160x120")
 
 
 # ---- 命令：切换预览/拍照分辨率 ----
@@ -908,6 +996,10 @@ def set_preview(name):
     with state_lock:
         preview["code"] = code
         preview["w"], preview["h"] = RES[code][1], RES[code][2]
+    # 用户手动切换分辨率: 复位自动降级状态(允许回高后再触发, 避免永久锁死在低档)
+    _auto_ql["dropped"] = False
+    _auto_ql["cooldown"] = time.time() + 10.0
+    _auto_ql["n"] = 0
     if _send_cmd(("V" + code).encode()):
         print(f"预览分辨率已切换: {name}", flush=True)
     else:
@@ -976,41 +1068,60 @@ def poll_photo(_=None):
 
 
 def render():
-    # 只画最新帧: 一次性取空队列只留最后一个, 积压的旧帧直接丢弃 -> 显示不滞后
+    # 帧到达驱动: 只在有待画帧时快速重排, 无帧低频扫描 —— 不无谓轮询抢 GIL。
+    # 缩放已由 decode_worker 的 _fit_display 算好(队列内容为 (disp, nw, nh)),
+    # 这里只做"上屏"最小操作: 单例 PhotoImage paste() 就地刷新 + itemconfig 复用
+    # canvas item, 不新建、不重建 —— 主线程 GIL 持有压到最短, 上屏 fps 逼近链路。
     data = None
-    while True:
+    try:
+        data = q.get_nowait()
+    except queue.Empty:
+        pass
+    while True:                      # 一次只消费最新一帧(丢弃积压旧帧)
         try:
-            data = q.get_nowait()
+            nxt = q.get_nowait()
+            data = nxt
         except queue.Empty:
             break
+    now = time.time()
     if data:
-        img, w, h = data
-        # 固定显示框内"只缩小不放大": 大分辨率等比缩小, 小分辨率按原生像素居中。
-        # 分辨率与画面大小无关, 切分辨率只影响清晰度, 绝不把画面放大。
-        scale = min(1.0, DISP_W / max(w, 1), DISP_H / max(h, 1))
-        nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
-        # 等尺寸直接复用原图(省掉无谓 resize, 提升实时流畅度); 需缩小才重采样
-        if (nw, nh) == (w, h):
-            disp = img
+        last_render[1] = now
+        disp, nw, nh = data
+        # 复用单例 PhotoImage: 尺寸不变用 paste() 在原 Tk 图像上就地刷像素 —— 比每帧
+        # 新建 ImageTk.PhotoImage(本机分配+后续 GC)更省, 是高帧率上屏的关键开销(Tk 非
+        # 线程安全, 所有 Tk 调用必须在主线程)。
+        if _canvas_photo[0] is None or _canvas_photo[0].width() != nw or \
+                _canvas_photo[0].height() != nh:
+            _canvas_photo[0] = ImageTk.PhotoImage(disp)   # 尺寸变化才重建
         else:
-            disp = img.resize((nw, nh), Image.BILINEAR)
-        photo_image = ImageTk.PhotoImage(disp)
-        canvas.delete("all")
-        canvas.create_image(DISP_W // 2, DISP_H // 2, image=photo_image)
-        canvas.image = photo_image
-        # 实时帧率: 每秒结算一次, 显示最近 1s 内实际渲染的帧数
-        now = time.time()
-        fps_stat[1] += 1
-        if now - fps_stat[0] >= 1.0:
-            fps_stat[2] = fps_stat[1] / (now - fps_stat[0])
+            _canvas_photo[0].paste(disp)                   # 同尺寸: 就地更新像素
+        photo = _canvas_photo[0]
+        if _canvas_item[0] is None:
+            _canvas_item[0] = canvas.create_image(DISP_W // 2, nh // 2 + (DISP_H - nh) // 2,
+                                                  image=photo)
+        else:
+            canvas.itemconfig(_canvas_item[0], image=photo)
+        canvas.image = photo                     # 持引用防 GC 回收 Tk 图像
+        # 实时帧率: 链路 = reader 解析到帧的每秒增量(frame_count);
+        # 上屏   = render 实际画出画面的每秒次数(gui_stat)。
+        gui_stat[1] += 1
+        if now - gui_stat[0] >= 1.0:
+            gui_stat[2] = gui_stat[1] / (now - gui_stat[0])
+            gui_stat[0] = now
+            gui_stat[1] = 0
+        if frame_count[0] >= fps_stat[1]:
+            fps_stat[2] = (frame_count[0] - fps_stat[1]) / (now - fps_stat[0])
             fps_stat[0] = now
-            fps_stat[1] = 0
+            fps_stat[1] = frame_count[0]
         src = {"relay": "中继", "wifi": "WiFi", "auto": "自动"}.get(MODE, "串口")
         p2p_txt = " P2P" if _P2P and not _P2P_DISABLED else ""
         fps_lbl.config(
-            text=f"{src}{p2p_txt} 实时 {fps_stat[2]:.1f} fps | "
-                 f"{w}x{h} -> 显示 {nw}x{nh} | 累计 {frame_count[0]}")
-    root.after(30, render)
+            text=f"{src}{p2p_txt} 链路 {fps_stat[2]:.1f} fps | 上屏 {gui_stat[2]:.1f} fps | "
+                 f"显示 {nw}x{nh} | 累计 {frame_count[0]}")
+    if data is not None:
+        root.after(1, render)        # 刚画了帧, 紧跟下一帧
+    else:
+        root.after(25, render)       # 无待画帧: 低频扫描, 少抢 GIL
 
 
 # ---- 单实例互斥锁 ----
@@ -1033,24 +1144,27 @@ except OSError:
 
 root = tk.Tk()
 root.title(f"OV2640 实时预览+动态拍照 [{port}@{baud}]")
+Gs.apply_theme(root)
+root.minsize(700, 560)
 
-top = tk.Frame(root); top.pack(fill="x", padx=6, pady=6)
-tk.Label(top, text="预览:").pack(side="left")
+top = tk.Frame(root, bg=Gs.PANEL); top.pack(fill="x")
+tb = tk.Frame(top, bg=Gs.PANEL); tb.pack(fill="x", padx=8, pady=6)
+Gs.section_label(tb, "预览:").pack(side="left")
 preview_var = tk.StringVar(value=res_label("t"))
-tk.OptionMenu(top, preview_var, *PREVIEW_CHOICES, command=set_preview).pack(side="left", padx=3)
-tk.Label(top, text="拍照:").pack(side="left", padx=(12, 0))
+Gs.option_menu(tb, preview_var, PREVIEW_CHOICES, command=set_preview).pack(side="left", padx=3)
+Gs.section_label(tb, "拍照:").pack(side="left", padx=(14, 0))
 photo_var = tk.StringVar(value=res_label("u"))
-tk.OptionMenu(top, photo_var, *PHOTO_CHOICES, command=set_photo).pack(side="left", padx=3)
-btn = tk.Button(top, text="拍 照", command=do_photo,
-                bg="#2d8", activebackground="#1b6", font=("", 12, "bold"))
+Gs.option_menu(tb, photo_var, PHOTO_CHOICES, command=set_photo).pack(side="left", padx=3)
+btn = ttk.Button(tb, text="拍 照", style="Photo.TButton", command=do_photo)
 btn.pack(side="right")
 
-status_lbl = tk.Label(root, text="连接中...", anchor="w", padx=6, fg="#666")
+status_lbl = tk.Label(root, text="连接中...", anchor="w", padx=10, pady=4,
+                      fg=Gs.FG_DIM, bg=Gs.BG)
 status_lbl.pack(fill="x")
 DISP_W, DISP_H = 640, 480   # 固定显示框: 任何分辨率等比缩放后居中, 画面大小不变只更清晰
-canvas = tk.Canvas(root, width=DISP_W, height=DISP_H, bg="black", highlightthickness=0)
-canvas.pack()
-fps_lbl = tk.Label(root, text="", anchor="w", padx=6)
+canvas = Gs.video_canvas(root, DISP_W, DISP_H)
+canvas.pack(padx=8, pady=(0, 6), fill="both", expand=True)
+fps_lbl = tk.Label(root, text="", anchor="w", padx=10, pady=4, fg=Gs.FG, bg=Gs.BG)
 fps_lbl.pack(fill="x")
 
 root.bind("<Control-q>", lambda e: (stop.set(), root.destroy()))

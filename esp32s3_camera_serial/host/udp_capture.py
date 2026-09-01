@@ -63,6 +63,7 @@ G = {
     "photo_pending": False,  # 已发 P 待收照片: 下一个完整 TCP 帧单元路由给照片而非预览
 }
 samples = deque(maxlen=1024)         # (t, bytes) 完整帧滚动记录
+up_samples = deque(maxlen=512)       # 上屏时刻滚动记录(与 samples 同 5s 窗口口径)
 seq_state = {"last": None}           # 最近一次完整帧的 seq(用于丢帧估算)
 tcp_rx = bytearray()                 # TCP 唯一接收缓冲: 单点读取再分发给照片/预览解析
 stat_t = [time.time()]
@@ -248,14 +249,18 @@ def send_cmd(data):
 
 
 def open_tcp_cmd(stop_ev):
+    # 初始命令必须带默认预览分辨率: 固件分辨率是状态化的, 上次会话/误触会残留
+    # (如 UXGA 1600x1200), 启动时若只发 'U' 不切分辨率, 固件继续发大帧, 链路
+    # 帧率会掉到 2-3fps。默认拉回 QVGA; 命令行显式指定 res_code 时以它为准。
+    initial_cmd = mode_cmd(res_code or "t")
     for _ in range(600):
         if stop_ev.is_set():
             return None
         try:
             c = socket.create_connection((host, port), timeout=4)
             c.settimeout(0.05)
-            c.sendall(mode_cmd(res_code).encode())
-            print(f"TCP 已连 {host}:{port}, 已发 {mode_cmd(res_code)!r}", flush=True)
+            c.sendall(initial_cmd.encode())
+            print(f"TCP 已连 {host}:{port}, 已发 {initial_cmd!r}", flush=True)
             return c
         except OSError:
             time.sleep(1.0)
@@ -351,7 +356,13 @@ def _reader_body(stop_ev):
 
         if time.time() - stat_t[0] >= 3.0:
             n, byt = window_stats()
-            print(f"{G['mode']:>3} fps={n / STAT_WINDOW:6.1f} kb={(byt / 1024) / STAT_WINDOW:5.0f}/s "
+            now = time.time()
+            # 上屏 fps(同 5s 窗口): 与"链路 fps"并列, 一眼分辨瓶颈在传输还是显示端
+            while up_samples and up_samples[0] < now - STAT_WINDOW:
+                up_samples.popleft()
+            fps_up = len(up_samples) / STAT_WINDOW
+            print(f"{G['mode']:>3} 链路={n / STAT_WINDOW:6.1f} 上屏={fps_up:6.1f} fps "
+                  f"kb={(byt / 1024) / STAT_WINDOW:5.0f}/s "
                   f"累计 {G['frames']} 丢帧 {G['drops']}", flush=True)
             stat_t[0] = time.time()
 
@@ -458,6 +469,7 @@ if SELFTEST:
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
+from lib import gui_style as Gs
 
 ui = {}          # 控件句柄/渲染状态集中存放
 
@@ -465,53 +477,61 @@ ui = {}          # 控件句柄/渲染状态集中存放
 def build_ui(root):
     ui["root"] = root
     root.title(f"OV2640 实时预览 [{host}:{port}]")
+    Gs.apply_theme(root)
+    root.minsize(720, 540)
 
-    # ---- 工具栏 ----
-    bar = ttk.Frame(root); bar.pack(fill="x", padx=6, pady=(6, 0))
+    # ---- 工具栏(深色面板底, 通栏) ----
+    bar = ttk.Frame(root, style="Bar.TFrame"); bar.pack(fill="x")
+    tb = ttk.Frame(bar, style="Bar.TFrame"); tb.pack(fill="x", padx=8, pady=6)
 
-    ttk.Label(bar, text="传输:").pack(side="left")
-    mode_cb = ttk.Combobox(bar, values=["UDP", "TCP"], state="readonly", width=6)
-    mode_cb.set("UDP"); mode_cb.pack(side="left", padx=(4, 10))
+    Gs.section_label(tb, "传输:").pack(side="left")
+    mode_cb = ttk.Combobox(tb, values=["UDP", "TCP"], state="readonly", width=6)
+    mode_cb.set("UDP"); mode_cb.pack(side="left", padx=(4, 12))
     ui["mode_cb"] = mode_cb
 
-    ttk.Label(bar, text="预览:").pack(side="left")
+    Gs.section_label(tb, "预览:").pack(side="left")
     # width 需容纳 "UXGA 1600x1200" 这类带尺寸标签, 否则选中框显示被截断
-    res_cb = ttk.Combobox(bar, values=RES_LABELS, state="readonly", width=14)
-    res_cb.set(res_label("QVGA")); res_cb.pack(side="left", padx=(4, 10))
+    res_cb = ttk.Combobox(tb, values=RES_LABELS, state="readonly", width=14)
+    res_cb.set(res_label("QVGA")); res_cb.pack(side="left", padx=(4, 12))
     ui["res_cb"] = res_cb
 
-    ttk.Label(bar, text="画质:").pack(side="left")
+    Gs.section_label(tb, "画质:").pack(side="left")
     q_var = tk.IntVar(value=10)
-    q_scale = ttk.Scale(bar, from_=8, to=40, variable=q_var, length=110)
+    q_scale = ttk.Scale(tb, from_=8, to=40, variable=q_var, length=110)
     q_scale.pack(side="left", padx=(4, 2))
-    q_lbl = ttk.Label(bar, text=str(q_var.get()), width=3)
-    q_lbl.pack(side="left", padx=(0, 10))
+    q_lbl = ttk.Label(tb, text=str(q_var.get()), width=3)
+    q_lbl.pack(side="left", padx=(0, 12))
     ui["q_var"], ui["q_lbl"] = q_var, q_lbl
 
-    ttk.Label(bar, text="拍照:").pack(side="left")
-    photo_cb = ttk.Combobox(bar, values=RES_LABELS, state="readonly", width=14)
+    Gs.section_label(tb, "拍照:").pack(side="left")
+    photo_cb = ttk.Combobox(tb, values=RES_LABELS, state="readonly", width=14)
     photo_cb.set(res_label("UXGA")); photo_cb.pack(side="left", padx=(4, 4))
     ui["photo_cb"] = photo_cb
 
-    photo_btn = ttk.Button(bar, text="拍照", command=lambda: take_photo())
-    photo_btn.pack(side="left", padx=(0, 8))
+    photo_btn = ttk.Button(tb, text="拍照", style="Photo.TButton",
+                           command=lambda: take_photo())
+    photo_btn.pack(side="left", padx=(6, 4))
     ui["photo_btn"] = photo_btn
 
-    snap_btn = ttk.Button(bar, text="存图(Ctrl+S)", command=snapshot)
+    snap_btn = ttk.Button(tb, text="存图(Ctrl+S)", command=snapshot)
     snap_btn.pack(side="left")
 
-    # ---- 视频区 ----
-    video = tk.Label(root, bg="#101010", width=88, height=30)
-    video.pack(padx=6, pady=4, fill="both", expand=True)
+    # ---- 视频区(固定 Canvas: 画面居中适配, 不随帧变化撑动窗口) ----
+    # 原用 Label 且每帧 config(width=画面宽, height=画面高): Label 的 requested
+    # size 随图像变化 -> 窗口被反复撑大/缩小("画面逐渐自动变化大小")。Canvas 的
+    # 尺寸由用户拖窗决定, 画面在其中等比缩放居中, 不会反馈改变窗口布局。
+    video = Gs.video_canvas(root, 640, 480)
+    video.pack(padx=8, pady=6, fill="both", expand=True)
     ui["video"] = video
 
-    # ---- 状态栏 ----
-    foot = ttk.Frame(root); foot.pack(fill="x", padx=6, pady=(0, 6))
-    badge = tk.Label(foot, text=" 连接中 ", fg="white", bg="#c60", padx=6)
+    # ---- 状态栏(深色面板底) ----
+    foot = ttk.Frame(root, style="Bar.TFrame"); foot.pack(fill="x")
+    fb = ttk.Frame(foot, style="Bar.TFrame"); fb.pack(fill="x", padx=8, pady=6)
+    badge = Gs.badge(fb, " 连接中 ")
     badge.pack(side="left")
-    info = ttk.Label(foot, text="-", anchor="w")
-    info.pack(side="left", fill="x", expand=True, padx=8)
-    tip = ttk.Label(foot, text="Ctrl+Q 退出", foreground="#888")
+    info = ttk.Label(fb, text="-", anchor="w")
+    info.pack(side="left", fill="x", expand=True, padx=10)
+    tip = ttk.Label(fb, text="Ctrl+Q 退出", foreground=Gs.FG_HINT)
     tip.pack(side="right")
     ui["badge"], ui["info"] = badge, info
 
@@ -598,10 +618,13 @@ def _watch_color_impl(img):
     try:
         rgb = img.convert("RGB").crop((img.width // 4, img.height // 4,
                                        img.width * 3 // 4, img.height * 3 // 4))
-        px = list(rgb.resize((24, 24)).getdata())
-        r = sum(p[0] for p in px) / len(px)
-        g = sum(p[1] for p in px) / len(px)
-        b = sum(p[2] for p in px) / len(px)
+        # 直接取 RGB888 连续缓冲按通道切片求和(C 级): 原用 getdata() 逐像素构造
+        # Python 元组, 每秒刷一次 DeprecationWarning 且慢一个量级(Pillow 14 将移除)。
+        buf = rgb.resize((24, 24)).tobytes()
+        n = len(buf) // 3
+        r = sum(buf[0::3]) / n
+        g = sum(buf[1::3]) / n
+        b = sum(buf[2::3]) / n
     except Exception:
         return
     if b - r > 40 and b - g > 40:
@@ -619,17 +642,50 @@ def _watch_color_impl(img):
                 info.config(text="检测到色彩异常(紫屏), 已自动重建摄像头")
 
 
+_photo = [None]      # PhotoImage 单例缓存
+
+
+_canvas_item = [None]    # Canvas 图像 item 句柄(复用, 不随帧重建)
+
+
 def show_on_video(img):
-    """等比缩放铺进视频区并刷新 Label。"""
+    """等比缩放铺进视频区居中显示, 不改变视频区/窗口尺寸。
+
+    修复: 原实现每次上屏都 config Label 的 width/height = 画面缩放尺寸,
+    Label 的 requested size 随图像变化 -> 窗口被反复撑大/缩小(画面逐渐
+    自动变化大小)。改用 Canvas: 尺寸由用户拖窗决定, 画面等比缩放居中,
+    不反馈改变窗口布局。
+    高帧率优化(与 live_capture 的 render 对齐):
+      1) 缩放显式指定重采样: 放大 2x 以上用 NEAREST(最省), 其余 BILINEAR。
+      2) 复用 PhotoImage + canvas item: 同尺寸 paste 0.60ms/帧 vs 新建 1.10ms,
+         且不产生 Tk 本机对象 GC 压力。
+    注意: PIL 的 ImageTk.PhotoImage 只有 paste(), 没有 tkinter.PhotoImage 的 put()。
+    """
     watch_color(img)
     vw = max(ui["video"].winfo_width(), 320)
     vh = max(ui["video"].winfo_height(), 240)
-    img = img.copy()
-    img.thumbnail((vw, vh))
-    ph = ImageTk.PhotoImage(img)
-    lb = ui["video"]
-    lb.config(image=ph, width=img.width, height=img.height)
-    lb.image = ph                             # 防 GC 回收
+    scale = min(vw / max(img.width, 1), vh / max(img.height, 1))
+    nw = max(1, int(round(img.width * scale)))
+    nh = max(1, int(round(img.height * scale)))
+    if (nw, nh) == (img.width, img.height):
+        disp = img
+    elif nw >= img.width * 2:
+        disp = img.resize((nw, nh), Image.NEAREST)
+    else:
+        disp = img.resize((nw, nh), Image.BILINEAR)
+    ph = _photo[0]
+    if ph is None or ph.width() != nw or ph.height() != nh:
+        ph = ImageTk.PhotoImage(disp)         # 尺寸变化才重建(Tk 本机资源分配)
+        _photo[0] = ph
+    else:
+        ph.paste(disp)                        # 同尺寸: 只换像素, 不新建对象
+    cv = ui["video"]
+    if _canvas_item[0] is None:
+        _canvas_item[0] = cv.create_image(vw // 2, vh // 2, image=ph)
+    else:
+        cv.coords(_canvas_item[0], vw // 2, vh // 2)   # 用户拖窗后画面保持居中
+        cv.itemconfig(_canvas_item[0], image=ph)
+    cv.image = ph                             # 防 GC 回收
 
 
 def handle_photo(raw, w, h):
@@ -677,15 +733,20 @@ display_q = queue.Queue(maxsize=2)
 
 def decode_worker(stop_ev):
     """后台解码线程: 从 prev_q 取最新帧解码为 PIL Image, 放入 display_q。
-    将 JPEG 解码(VGA 下 15-30ms)移出 tkinter 主线程, 消除 UI 响应卡顿。"""
+    将 JPEG 解码(VGA 下 15-30ms)移出 tkinter 主线程, 消除 UI 响应卡顿。
+
+    关键: 取帧必须【非阻塞】。此前内层用 prev_q.get(timeout=0.1), 队列一空
+    就要阻塞满 100ms 才交付本轮解码, 解码吞吐被锁死在 ≈1/0.1 = 10fps,
+    无论链路多少帧上屏都上不去。改为 nowait 取空 + 短 sleep 让出 GIL。"""
     while not stop_ev.is_set():
         latest = None
-        try:
-            while True:
-                latest = prev_q.get(timeout=0.1)
-        except queue.Empty:
-            pass
+        while True:
+            try:
+                latest = prev_q.get_nowait()    # 取到最后一个即最新帧
+            except queue.Empty:
+                break
         if latest is None:
+            time.sleep(0.001)                   # 无帧: 让出 GIL, 不空转抢 Tk
             continue
         fmt, raw, w, h = latest
         ui["last_frame"] = latest          # 供 snapshot() 使用(GIL 下原子赋值)
@@ -701,6 +762,10 @@ def decode_worker(stop_ev):
             except queue.Empty:
                 pass
             display_q.put(img)
+            # 与 live_capture 对齐: 解码完主动让出 GIL。PIL 解码/ImageTk 都持有
+            # CPython GIL, 解码线程若一直占锁, Tk 主线程的 render 轮不到时间片
+            # -> 上屏掉帧。1ms 让出不明显降低解码吞吐(理论仍 >500fps)。
+            time.sleep(0.001)
         except Exception as e:
             print(f"解码异常: {e}", flush=True)
 
@@ -730,6 +795,7 @@ def render_loop(root):
         pass
     if latest_img:
         show_on_video(latest_img)
+        up_samples.append(time.time())
 
     # 4) 状态栏节流刷新(4Hz)
     now = time.time()
@@ -738,25 +804,30 @@ def render_loop(root):
         n, byt = window_stats()
         fps = n / STAT_WINDOW
         kbps = (byt / 1024) / STAT_WINDOW
+        while up_samples and up_samples[0] < now - STAT_WINDOW:
+            up_samples.popleft()
+        fps_up = len(up_samples) / STAT_WINDOW
         mode = G["mode"]
         res = ui["res_cb"].get()
         connected = G["tcp"] is not None
         alive = connected and (now - G["last_good"] < RECONNECT_AFTER)
         badge = ui["badge"]
         if alive:
-            badge.config(text=" ● 实时 ", bg="#0a0")
+            badge.config(text=" ● 实时 ", bg=Gs.OK)
         elif connected:
-            badge.config(text=" ◐ 等帧 ", bg="#c60")
+            badge.config(text=" ◐ 等帧 ", bg=Gs.WARN)
         else:
-            badge.config(text=" ○ 未连 ", bg="#a33")
+            badge.config(text=" ○ 未连 ", bg=Gs.DANGER)
         note = ""
         if now < G["photo_until"]:
             note = " | 拍照中…"
-        ui["info"].config(text=f"{mode} {res}  {fps:5.1f} fps  {kbps:4.0f} KB/s  "
-                               f"帧计 {G['frames']} 丢帧 {G['drops']}{note}")
+        ui["info"].config(text=f"{mode} {res}  链路 {fps:5.1f} | 上屏 {fps_up:5.1f} fps  "
+                               f"{kbps:4.0f} KB/s  帧计 {G['frames']} 丢帧 {G['drops']}{note}")
 
     if not stop_ev.is_set():
-        root.after(15, render_loop, root)
+        # 自适应节奏: 刚画过帧(说明还有后续帧)则紧跟 2ms 贴近出流;
+        # 空闲时退回 30ms 低频扫描, 减少与解码线程的 GIL 争用。
+        root.after(2 if latest_img else 30, render_loop, root)
 
 
 def main():

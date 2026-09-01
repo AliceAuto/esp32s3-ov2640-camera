@@ -6,6 +6,7 @@
 (如 convert_rgb 的舍入公式、OVU 头定义不一致)。本包收敛公共逻辑:
   - frame_parser : FRAME_BEGIN/SIZE/FRAME_END 文本流切帧
   - rgb565       : big-endian RGB565 -> RGB888 (numpy 向量化)
+  - gui_style    : 两套上位机共用的深色现代化主题(配色/字体/控件样式)
   - (规划) relay_client : 中继信令 + P2P 打洞
   - (规划) netio         : TcpIo/SerialIo 统一传输层
 """
