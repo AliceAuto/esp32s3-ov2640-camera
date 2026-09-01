@@ -14,10 +14,6 @@ from select import select
 import serial
 from PIL import Image, ImageTk
 import tkinter as tk
-try:
-    import numpy as _np
-except ImportError:
-    _np = None
 
 # ---- 传输通道选择 ----
 #   串口:   python live_capture.py COM7 [baud]
@@ -75,10 +71,17 @@ else:
     port = _pos[0] if _pos else "COM7"
     baud = int(_pos[1]) if len(_pos) > 1 else 2000000
 
-BEGIN = b"FRAME_BEGIN\n"
-END = b"FRAME_END\n"
-# 长时间没有任何字节/完整帧就强制重连串口（覆盖 MCU 死机复位的场景）
-RECONNECT_AFTER = 5.0
+# 帧协议解析 / RGB565 转换统一走 lib/ 公共库, 避免两套客户端各自实现发生漂移
+from lib.frame_parser import split_frames as _split_frames
+from lib.rgb565 import convert_rgb
+
+# 长时间没有任何字节/完整帧就强制重连串口（覆盖 MCU 死机复位的场景）。
+# 串口 5s；中继跨网 RTT/抖动大, 且切换分辨率/新观众接入后 camera 需收敛(sensor+adaptive quality),
+# 收紧为 5s 会把一次抖动误判为断链, 触发"整段重连->再抖动->再重连"风暴, 反而把 16~18fps 拖到 1~7fps。
+RECONNECT_AFTER_SERIAL = 5.0
+RECONNECT_AFTER_RELAY  = 15.0
+# 重连最小间隔: 即便判定超时, 也强制间隔 >= 此值再断开重连, 配合上面的宽阈值彻底杜绝重连风暴。
+MIN_RECONNECT_INTERVAL = 5.0
 # code -> (名称, w, h)
 RES = {
     "q": ("QQVGA", 160, 120),
@@ -101,7 +104,13 @@ out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photos")
 preview = {"code": "t", "w": 320, "h": 240}
 photo_cfg = {"code": "u"}
 photo_req = {"active": False, "w": 0, "h": 0, "rgb": None, "done": False}
-q = queue.Queue(maxsize=2)   # 最新帧优先: 最多积压 1 帧, 满时丢最旧, 显示永不滞后
+q = queue.Queue(maxsize=2)   # 显示队列(已解码 Image): 最新帧优先, 满时丢最旧, 显示永不滞后
+# 待解码原始帧队列(丢旧保新): reader 只做协议解析, 解码交给独立线程。
+# 原实现 reader 里同步 Image.open().convert() —— VGA+ 一帧解码 40-80ms,
+# 直接把收帧率拖到解码能力以下, 这是"实际客户端帧率低"的根因。
+decode_q = queue.Queue(maxsize=1)
+# 照片帧专用可靠队列: 拍照帧不可丢, 不能用丢旧保新策略
+photo_q = queue.Queue()
 # 实时帧率统计: [窗口起点时间, 窗口内渲染帧数, 实时帧率(fps)]
 fps_stat = [time.time(), 0, 0.0]
 
@@ -121,74 +130,66 @@ def put_latest(item):
             pass
 
 
+def _put_raw_latest(item):
+    """待解码原始帧入队(丢旧保新): 解码跟不上时只保留最新一帧。"""
+    try:
+        decode_q.put_nowait(item)
+    except queue.Full:
+        try:
+            decode_q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            decode_q.put_nowait(item)
+        except queue.Full:
+            pass
+
+
+def decode_one(fmt, w, h, raw):
+    """解码单帧: JPEG 走 PIL, RGB565 走 convert_rgb。失败返回 None 不抛异常。"""
+    try:
+        if fmt == "JPG":
+            if len(raw) > 100 and raw[:2] == b"\xff\xd8" and raw[-2:] == b"\xff\xd9":
+                return Image.open(io.BytesIO(raw)).convert("RGB")
+            return None
+        if len(raw) >= w * h * 2:
+            return Image.frombytes("RGB", (w, h), convert_rgb(bytes(raw[:w * h * 2])))
+        return None
+    except Exception:
+        return None
+
+
+def decode_worker():
+    """解码线程: 照片帧优先(可靠, 不可丢), 再处理预览帧(丢旧保新)。"""
+    while not stop.is_set():
+        try:
+            fmt, w, h, raw = photo_q.get(timeout=0.2)   # 照片帧: 阻塞短等
+        except queue.Empty:
+            pass
+        else:
+            img = decode_one(fmt, w, h, raw)
+            if img:
+                with state_lock:
+                    photo_req["rgb"] = img
+                    photo_req["done"] = True
+                    photo_req["active"] = False
+                print(f"收到照片帧 {w}x{h} {fmt}", flush=True)
+            continue
+        try:
+            fmt, w, h, raw = decode_q.get_nowait()       # 预览帧: 只取最新
+        except queue.Empty:
+            continue
+        img = decode_one(fmt, w, h, raw)
+        if img:
+            put_latest((img, w, h))
+
+
 frame_count = [0]
 
 ser = None
 wlock = threading.Lock()
 state_lock = threading.Lock()
 stop = threading.Event()
-
-
-def convert_rgb(frame):
-    """big-endian RGB565 -> RGB888。
-
-    numpy 向量化优先(VGA 640x480 约 2ms); 无 numpy 时回退纯 Python 逐像素
-    (同一帧数百 ms, 会拖垮帧率, 建议 pip install numpy)。
-    """
-    if _np is not None:
-        a = _np.frombuffer(frame, dtype=">u2")     # 大端 uint16
-        flat = _np.empty((a.size, 3), dtype=_np.uint8)
-        # 舍入公式必须与纯 Python 分支一致((v*255+15)//31), 否则结果差 1
-        flat[:, 0] = (((a >> 11) & 0x1F) * 255 + 15) // 31
-        flat[:, 1] = (((a >> 5) & 0x3F) * 255 + 31) // 63
-        flat[:, 2] = ((a & 0x1F) * 255 + 15) // 31
-        return flat.tobytes()
-    n = len(frame) // 2
-    rgb = bytearray(n * 3)
-    j = 0
-    for o in range(0, len(frame), 2):
-        v = (frame[o] << 8) | frame[o + 1]   # big-endian
-        r = (v >> 11) & 0x1F; g = (v >> 5) & 0x3F; b = v & 0x1F
-        rgb[j] = (r * 255 + 15) // 31
-        rgb[j + 1] = (g * 255 + 31) // 63
-        rgb[j + 2] = (b * 255 + 15) // 31
-        j += 3
-    return bytes(rgb)
-
-
-_BEGIN = b"FRAME_BEGIN\n"
-_END = b"FRAME_END\n"
-
-
-def _split_frames(s):
-    """从累积缓冲切出所有完整帧单元。
-
-    返回 ([(w, h, fmt, body), ...], 已消费字节数)。
-    此前用 re.S + .*? 在累积缓冲上反复回溯匹配, 高分辨率下正则开销显著;
-    改为 find() 定位定界符 + 切片(与 udp_capture._pump_bytes 一致), 一次线性扫描。
-    """
-    out = []
-    pos = 0
-    while True:
-        i = s.find(_BEGIN, pos)
-        if i < 0:
-            # 只保留可能被截断在缓冲尾部的半个 _BEGIN
-            return out, max(0, len(s) - len(_BEGIN) + 1)
-        nl = s.find(b"\n", i + len(_BEGIN))
-        if nl < 0:
-            return out, i
-        e = s.find(_END, nl + 1)
-        if e < 0:
-            return out, i
-        parts = s[i + len(_BEGIN):nl].split()
-        if len(parts) >= 3 and parts[0] == b"SIZE":
-            try:
-                out.append((int(parts[1]), int(parts[2]),
-                            parts[3].decode("ascii", "ignore"), s[nl + 1:e]))
-            except ValueError:
-                pass
-        pos = e + len(_END)
-    return out, pos
 
 
 def discover_cameras(timeout=4.0):
@@ -661,7 +662,24 @@ def _make_socket_io(host, portn):
         try:
             s = socket.create_connection((host, portn), timeout=4)
             s.settimeout(0.05)
-            return TcpIo(s)
+            io = TcpIo(s)
+            # 连接后立即一次性对齐板子状态(收流前下发, 避免"等首帧才同步"的死锁):
+            #   1) N   : 板子 udp_mode 是全局态, 若之前被 udp_capture/udp_fps 设成
+            #             UDP 模式, 纯 TCP 预览的 live_capture 一帧都收不到
+            #   2) V+H : 把板子切到 GUI 当前选择的分辨率。否则若板子停留在别的
+            #             分辨率(如被别的客户端设成 SVGA), 帧尺寸与 preview 不符
+            #             会被全部丢弃 -> 黑屏 + 重连风暴, 帧率拖到个位数。
+            # 注意只发一次: resync_board 在非串口模式跳过重同步(切分辨率会重建
+            # 相机中断推流, 反复下发会形成重连死循环), 这里补上一次性对齐。
+            try:
+                with state_lock:
+                    _p = preview.get("code", "q")
+                    _h = photo_cfg.get("code", "u")
+                io.write(("V" + _p + "H" + _h + "N").encode())
+                io.flush()
+            except Exception:
+                pass
+            return io
         except Exception:
             time.sleep(1.0)   # WiFi: 板子可能还在复位/开机, 慢速重试
     return None
@@ -724,9 +742,10 @@ def resync_board():
     try:
         with wlock:
             if ser:
-                ser.write(("V" + pcode + "H" + hcode).encode())
+                # 追加 N: 每次(重)同步都确保板子在 TCP 模式(本客户端纯 TCP 预览)
+                ser.write(("V" + pcode + "H" + hcode + "N").encode())
                 ser.flush()
-        print(f"重同步下发 V{pcode} H{hcode}", flush=True)
+        print(f"重同步下发 V{pcode} H{hcode} N", flush=True)
     except Exception:
         pass
 
@@ -741,6 +760,8 @@ def reader():
     buf = bytearray()
     last_frame_time = 0.0
     conn_time = time.time()          # 本次连接建立时刻(用于"始终无首帧"也强制重连)
+    recon_after = RECONNECT_AFTER_RELAY if MODE == "relay" else RECONNECT_AFTER_SERIAL
+    conn_camp = conn_time            # 本次重连时刻, 用于重连最小间隔退避
     _dbg_read_total = 0
     _dbg_read_t0 = time.time()
     _dbg_parsed = 0      # 本次窗口内 _split_frames 返回的完整帧数
@@ -765,6 +786,8 @@ def reader():
             buf = bytearray()
             last_frame_time = 0.0
             conn_time = time.time()
+            recon_after = RECONNECT_AFTER_RELAY if MODE == "relay" else RECONNECT_AFTER_SERIAL
+            conn_camp = time.time()
             _dbg_read_total = 0
             _dbg_read_t0 = time.time()
             continue
@@ -788,8 +811,14 @@ def reader():
             # 同时覆盖"连上后始终无首帧"(如 P2P 降级回中继但固件未回退推流):
             # 二者任一超时都强制重连, 杜绝黑屏死等。
             now = time.time()
-            no_frame = (last_frame_time and now - last_frame_time > RECONNECT_AFTER) \
-                or (not last_frame_time and now - conn_time > RECONNECT_AFTER)
+            no_frame = (last_frame_time and now - last_frame_time > recon_after) \
+                or (not last_frame_time and now - conn_time > recon_after)
+            # 退避: 距上次(重)连不足阈值时, 即便判定超时也再等不再重连。
+            # 摄像机切换分辨率/新观众接入后需收敛几百 ms~数秒, 抖动期无需整段重建;
+            # 强行重连只会再触发一次启动收敛, 陷入"重连->再抖动->再重连"风暴。
+            if no_frame and now - conn_camp < MIN_RECONNECT_INTERVAL:
+                time.sleep(0.25)
+                continue
             if no_frame:
                 global _P2P_DISABLED
                 if _P2P and not _P2P_DISABLED:
@@ -810,6 +839,8 @@ def reader():
                 buf = bytearray()
                 last_frame_time = 0.0
                 conn_time = time.time()
+                conn_camp = now           # 记录本次重连, 供退避判定
+                recon_after = RECONNECT_AFTER_RELAY if MODE == "relay" else RECONNECT_AFTER_SERIAL
             time.sleep(0.002)
             continue
         buf += data
@@ -827,32 +858,23 @@ def reader():
                 pw, ph = preview["w"], preview["h"]
                 want_photo = photo_req.get("active")
                 pw_, ph_ = photo_req["w"], photo_req["h"]
-            ok = False
-            frame_rgb = None
+            # 只做结构校验(头尾/长度), 真正的 JPEG 解码/ RGB 转码交给
+            # decode_worker 线程 —— 原实现同步解码, VGA+ 每帧 40-80ms,
+            # 收帧率被解码能力卡死(帧率低根因)。
             if fmt == "JPG":
-                # JPEG: 长度不定，直接整体解码（校验 JPEG 头尾）
-                if len(body) > 100 and body[:2] == b"\xff\xd8" and body[-2:] == b"\xff\xd9":
-                    _dbg_valid += 1
-                    ok = True
-                    try:
-                        frame_rgb = Image.open(io.BytesIO(body)).convert("RGB")
-                    except Exception:
-                        ok = False
+                valid = len(body) > 100 and body[:2] == b"\xff\xd8" and body[-2:] == b"\xff\xd9"
+                raw = body
             else:
-                # RGB565 big-endian: 长度需等于 w*h*2
-                ok = len(body) >= fb_len
-                if ok:
-                    frame_rgb = Image.frombytes("RGB", (w, h),
-                                                convert_rgb(bytes(body[:fb_len])))
-            if ok and frame_rgb:
+                valid = len(body) >= fb_len
+                raw = bytes(body[:fb_len])
+            if valid:
                 if (w, h) == (pw, ph):
-                    put_latest((frame_rgb, w, h))   # 最新帧优先, 丢旧保流畅
+                    _dbg_valid += 1
+                    _put_raw_latest((fmt, w, h, raw))   # 丢旧保新, 异步解码
                     frame_count[0] += 1
                 elif want_photo and (w, h) == (pw_, ph_):
-                    with state_lock:
-                        photo_req["rgb"] = frame_rgb
-                        photo_req["done"] = True
-                        photo_req["active"] = False
+                    _dbg_valid += 1
+                    photo_q.put((fmt, w, h, raw))       # 照片帧不可丢
                     print(f"收到照片帧 {w}x{h} {fmt}", flush=True)
                 last_frame_time = time.time()
         buf = bytearray(s[consumed:])
@@ -991,6 +1013,24 @@ def render():
     root.after(30, render)
 
 
+# ---- 单实例互斥锁 ----
+# 根因修复(多观众竞争): 同一台电脑被反复启动多个 live_capture 抢占同一摄像头时,
+# 中继端"新观众踢旧观众"+ 客户端被踢后立即重连, 形成"互相踢->互相重连"的乒乓,
+# 数据流反复重建导致帧率被反复拖垮(16~18fps -> 1~7fps)。杀掉进程只能临时缓解。
+# 这里通过独占绑定固定本地端口实现单实例: 第二个实例绑定失败即判定已有一个在跑,
+# 直接退出并提示, 从根上保证同一摄像头只会被一个观众稳定推流, 杜绝竞争。
+import socket as _sock
+_SINGLE_LOCK_PORT = 28336
+_single_lock = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+try:
+    _single_lock.bind(("127.0.0.1", _SINGLE_LOCK_PORT))
+    _single_lock.listen(1)
+except OSError:
+    print("[冲突] 已有一个 live_capture 实例在运行(端口 %d 被占用)。"
+          "同一摄像头只会服务一个观众, 请关闭旧窗口后再启动, 以免多实例竞争拖垮帧率。"
+          % _SINGLE_LOCK_PORT, flush=True)
+    sys.exit(0)
+
 root = tk.Tk()
 root.title(f"OV2640 实时预览+动态拍照 [{port}@{baud}]")
 
@@ -1016,7 +1056,9 @@ fps_lbl.pack(fill="x")
 root.bind("<Control-q>", lambda e: (stop.set(), root.destroy()))
 th = threading.Thread(target=reader, daemon=True)
 th.start()
-print("reader 线程已启动, 等待串口...", flush=True)
+th_dec = threading.Thread(target=decode_worker, daemon=True)
+th_dec.start()
+print("reader + decode_worker 线程已启动, 等待串口...", flush=True)
 root.after(30, render)
 root.mainloop()
 stop.set()

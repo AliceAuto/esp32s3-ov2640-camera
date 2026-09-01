@@ -206,8 +206,18 @@ struct TxFrame {
   uint16_t w, h;
   int8_t   slot;       // >=0: 来自帧池, 归还时放回空闲队列; -1: heap_caps_free
 };
-#define TXQ_DEPTH      4          // ~XGA 50KB/帧 -> 最坏积压 200KB PSRAM
-static QueueHandle_t       g_txq       = NULL;
+// 最新帧快照(替代 FIFO 队列): 采集与抽帧/发送解耦后不再排队积压。
+// 双槽乒乓: 生产侧(核1 采集)把最新帧写入空闲槽并标 ready; 发送侧(核0)每轮
+// 拉取最新 ready 槽。发送侧正读的槽被占用时生产侧直接跳过 memcpy(抽帧节拍在
+// 发送侧), 不为注定被丢的帧浪费时间; 发送侧永远发最新帧, 杜绝旧帧滞后。
+#define SNAP_SLOTS    2
+static TxFrame        g_snap[SNAP_SLOTS];
+static SemaphoreHandle_t g_snap_mutex = NULL;   // 保护 ready/inuse 标志切换(跨核)
+static SemaphoreHandle_t g_new_frame  = NULL;   // 发布信号: 生产侧发布新帧时 give
+static volatile uint8_t g_snap_ready[SNAP_SLOTS] = {0, 0};  // 槽内是最新未发帧
+static volatile uint8_t g_snap_inuse[SNAP_SLOTS] = {0, 0};  // 发送侧正读该槽
+static volatile uint32_t g_pub_seq   = 0;    // 单调发布序号(全局)
+static volatile uint32_t g_slot_seq[SNAP_SLOTS] = {0, 0};  // 每槽最近一次发布序号
 // 保护 cam_udp: sender_task(核0 优先级3) 发视频分片、relay_task(核0 优先级1) 打洞/STUN/
 // 排空都会操作同一个 WiFiUDP 对象。lwIP socket 与 WiFiUDP 内部状态均非线程安全,
 // 且两者同核, 高优先级 sender 可在 relay 执行 beginPacket 期间抢占 -> 状态错乱。
@@ -485,6 +495,28 @@ framesize_t framesize_from_code(char code) {
   }
 }
 
+// 中继 JSON 下行命令 {"t":"cmd","res":"Vx"} / {"t":"cmd","res":"Hx"} 解析。
+// 返回命令首字母('V'/'H', 兼容小写), code 回填分辨率码; 格式非法返回 0。
+// 兼容 json.dumps 默认格式("res": "Vx" 冒号后可能有空格)。JSON 小消息在中继链路走
+// 阻塞入队(reliable), 相比原始单字节透传不丢帧、不漂移。
+static char relay_cmd_lead(const char *s, char &code) {
+  if (!s) return 0;
+  const char *r = strstr(s, "\"res\"");
+  if (!r) return 0;
+  r += 5;
+  while (*r && *r != ':') r++;                 // 跳过键名到冒号
+  if (*r != ':') return 0;
+  r++;
+  while (*r && (*r == ' ' || *r == '\t')) r++; // 冒号后可能有空格
+  if (*r != '"') return 0;
+  r++;
+  if (!r[0] || !r[1]) return 0;
+  char lead = r[0];
+  if (lead != 'V' && lead != 'v' && lead != 'H' && lead != 'h') return 0;
+  code = r[1];
+  return lead;
+}
+
 // 每次 reinit 后重设传感器画质参数（deinit+init 会复位寄存器）
 void apply_color_calib() {
   sensor_t *s = esp_camera_sensor_get();
@@ -508,12 +540,21 @@ static bool cam_lock(uint32_t timeout_ms) {
   return g_cam_mutex && xSemaphoreTake(g_cam_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 static void cam_unlock() { if (g_cam_mutex) xSemaphoreGive(g_cam_mutex); }
-// 等待发送队列排空且没有在途帧。必须在任何 esp_camera_deinit/改分辨率前调用：
-// 队列里存的是已从相机驱动拷出的堆内存，切换本身安全，
+// 等待发送侧不再持有任何帧且在途帧归零。必须在任何 esp_camera_deinit/改分辨率前调用：
+// 快照里存的是已从相机驱动拷出的 PSRAM 内存，切换本身安全，
 // 但若在途帧还被 sender 引用就 deinit 会改变后续 fb 语义 —— 排空保证无竞争窗口。
 void wait_tx_idle(uint32_t timeout_ms) {
   uint32_t t0 = millis();
-  while ((uxQueueMessagesWaiting(g_txq) > 0 || g_inflight > 0) && millis() - t0 < timeout_ms) {
+  for (;;) {
+    bool busy = (g_inflight > 0);
+    if (!busy && g_snap_mutex) {
+      // 尚未被发送侧取走的 ready 帧也属未排空; inuse 槽(生产写中)同样占位。
+      for (int i = 0; i < SNAP_SLOTS; i++) {
+        if (g_snap_ready[i] || g_snap_inuse[i]) { busy = true; break; }
+      }
+    }
+    if (!busy) break;
+    if (millis() - t0 >= timeout_ms) break;
     delay(2);
   }
 }
@@ -630,39 +671,51 @@ bool camera_change_framesize(framesize_t fs) {
 }
 
 #ifdef ENABLE_WIFI
-// 抓帧 -> PSRAM 副本入队，立即归还驱动缓冲。队列满/拷贝失败按丢帧计数背压。
-// 在 loop 任务执行, 只做 memcpy 级工作(~7KB@QVGA), 不做任何阻塞发送。
+// 抓帧 -> PSRAM 副本写入"最新帧快照"双槽之一，立即归还驱动缓冲。
+// 采集与抽帧解耦核心: 发送侧抽取节拍, 本函数只把【最新】帧留在快照里,
+// 发送慢于采集(两槽都被占)时跳过 memcpy —— 不为注定被丢的帧浪费时间。
+// 只做 memcpy 级工作(~7KB@QVGA), 不做任何阻塞发送。
+//
+// 跨核握手(与 sender_task 在 g_snap_mutex 下互斥):
+//   槽状态机: 空闲 ->(生产写中, inuse=1)-> ready=1/不使用inuse ->(发送侧取走, inuse=1)
+//            -> 发送完释放 -> 空闲。
+//   生产侧: 只在"非 inuse"(空闲或已 ready 未取)槽上写; 写前释放槽内旧 buf(丢旧保新);
+//          memcpy 期间标 inuse=1 防发送侧同时读, 写毕置 ready 并 give 信号量唤醒发送。
+//   发送侧: 只取 "ready 且非 inuse" 的最新槽, 转移 buf 后置 inuse=1 防生产覆盖。
 void enqueue_frame(camera_fb_t *fb) {
-  TxFrame t;
-  t.buf = frame_alloc(fb->len, &t.slot);
-  if (!t.buf) { g_diag_skip_frames++; g_diag_last_err = -3; return; }
-  memcpy(t.buf, fb->buf, fb->len);
+  int slot = -1;
+  if (!xSemaphoreTake(g_snap_mutex, pdMS_TO_TICKS(10))) return;  // 忙/切换期放弃本帧
+  for (int i = 0; i < SNAP_SLOTS; i++) {
+    if (!g_snap_inuse[i]) { slot = i; break; }   // 空闲或已 ready 未取 -> 可写
+  }
+  if (slot < 0) {                                 // 两槽都在用(发送慢于采集)
+    xSemaphoreGive(g_snap_mutex);
+    g_diag_evict_frames++; g_adapt_total_evict++; g_diag_skip_frames++;
+    return;
+  }
+  TxFrame &t = g_snap[slot];
+  if (t.buf) { frame_free(t.buf, t.slot); t.buf = NULL; }   // 覆盖旧帧(丢旧保新)
+  g_snap_inuse[slot] = 1;                          // 生产写中, 占槽
+  xSemaphoreGive(g_snap_mutex);
+
+  uint8_t *buf = frame_alloc(fb->len, &t.slot);
+  memcpy(buf, fb->buf, fb->len);
+  t.buf = buf;
   t.len = fb->len;
   t.fmt = fb->format;
   t.w = fb->width;
   t.h = fb->height;
-  // 队列满=网络消费不动。策略: 丢【最旧】帧腾位让进【最新】帧(丢旧保新),
-  // 保证发送端永远取到当前最新画面, 观众看到实时而非积压的旧帧。
-  // 采集侧始终满帧率入队, 帧率不被通信延迟拖慢。
-  // 注意必须判满: 此前无条件出队, 队列退化为深度1(多分配的槽位白占 PSRAM),
-  // 且 skp 每帧+1 完全淹没真实丢帧 —— DIAG 的 skp 恒等于帧数, 无法再用于诊断。
-  if (uxQueueSpacesAvailable(g_txq) == 0) {
-    TxFrame victim;
-    if (xQueueReceive(g_txq, &victim, 0) == pdTRUE) {
-      frame_free(victim.buf, victim.slot);
-      g_diag_evict_frames++;             // 背压主动顶帧, 与链路丢帧分开统计
-      g_adapt_total_evict++;             // 独立累计(不被 log_diag 清零), 供 adapt_quality 判拥塞
-    }
-  }
-  if (xQueueSend(g_txq, &t, 0) != pdTRUE) {
-    frame_free(t.buf, t.slot);
-    g_diag_skip_frames++;                // 真丢帧: 入队失败
-    return;
-  }
+
+  xSemaphoreTake(g_snap_mutex, portMAX_DELAY);
+  g_slot_seq[slot] = ++g_pub_seq;                  // 标记为最新发布
+  g_snap_ready[slot] = 1;
+  g_snap_inuse[slot] = 0;                          // 发布完成, 供发送侧取走
+  xSemaphoreGive(g_snap_mutex);
+  if (g_new_frame) xSemaphoreGive(g_new_frame);    // 唤醒发送侧
   g_diag_cap_bytes += fb->len;
 }
 
-// 发送任务(核0)：出队 -> 按当前模式选通道 -> 记账 -> 释放。
+// 发送任务(核0)：拉取最新帧快照 -> 按当前模式选通道 -> 记账 -> 释放。
 // 局域网客户端(TCP/UDP)路径持 g_cli_mutex 保护 cam_client;
 // P2P/TURN/中继路径不碰 cam_client, 不持 g_cli_mutex —— 原实现所有路径都持该锁,
 // 导致跨网模式下 loop() 的 accept/命令解析被阻塞最坏 200ms。
@@ -671,7 +724,28 @@ void sender_task(void *arg) {
   camera_fb_t shim;
   IPAddress dst;
   for (;;) {
-    if (xQueueReceive(g_txq, &t, portMAX_DELAY) != pdTRUE) continue;
+    // 等待生产发布新帧; 唤醒后清掉积压计数, 只发"当前最新"一帧(抽帧节拍在此)。
+    if (g_new_frame) xSemaphoreTake(g_new_frame, portMAX_DELAY);
+    xSemaphoreTake(g_snap_mutex, portMAX_DELAY);
+    // 取最新 ready 槽(释放该槽所有权后本地持有发送), 其余 ready 旧帧丢弃。
+    int pick = -1; uint32_t best = 0;
+    for (int i = 0; i < SNAP_SLOTS; i++) {
+      if (g_snap_ready[i] && g_slot_seq[i] > best) { best = g_slot_seq[i]; pick = i; }
+    }
+    t.buf = NULL; t.slot = -1; t.len = 0;
+    if (pick >= 0) {
+      t = g_snap[pick];
+      g_snap[pick].buf = NULL;       // 转移所有权: 发送完成后由本任务释放
+      g_snap[pick].slot = -1;
+      g_snap_ready[pick] = 0;
+    } else {
+      // 无新帧(被生产覆盖前未发布临时窗口)或信号量被唤醒但无 ready, 软跳。
+      for (int i = 0; i < SNAP_SLOTS; i++) {
+        if (g_snap_ready[i]) { frame_free(g_snap[i].buf, g_snap[i].slot); g_snap[i].buf = NULL; g_snap_ready[i] = 0; }
+      }
+    }
+    xSemaphoreGive(g_snap_mutex);
+    if (!t.buf) continue;            // 无帧可发
     g_inflight++;
 
     memset(&shim, 0, sizeof(shim));
@@ -803,7 +877,9 @@ void setup() {
 
 #ifdef ENABLE_WIFI
   setup_wifi();
-  g_txq = xQueueCreate(TXQ_DEPTH, sizeof(TxFrame));
+  g_snap_mutex = xSemaphoreCreateMutex();
+  g_new_frame  = xSemaphoreCreateCounting(SNAP_SLOTS * 4, 0);   // 新帧发布信号量
+  memset(g_snap, 0, sizeof(g_snap));
   g_cam_mutex = xSemaphoreCreateMutex();
   g_cli_mutex = xSemaphoreCreateMutex();
   g_udp_mutex = xSemaphoreCreateMutex();
@@ -1215,6 +1291,35 @@ bool relay_read_msg() {
         g_p2p_next_retry = 0;
         Dbg.printf("[P2P] 对端 %u 个候选, 开始交叉打洞\n", g_p2p_npeer);
       }
+    }
+    else if (strstr(s, "\"cmd\"")) {
+      // 观众下行命令(可靠 JSON 通道): {"t": "cmd", "res": "Vx"/"Hx"} -> 执行并 ACK。
+      // 匹配 "\"cmd\"" 以兼容 json.dumps 冒号后空格("t": "cmd")。
+      char code = 0;
+      char lead = relay_cmd_lead(s, code);
+      char ack[96]; int ok = 0; int fs = -1;
+      if (lead) {
+        if (lead == 'V' || lead == 'v') {
+          framesize_t t = framesize_from_code(code);
+          if (t == FRAMESIZE_VGA) {
+            // 运行时切 VGA 触发 esp32-camera EV-VSYNC-OVF 死循环(库残bug), 拒绝防卡死
+            Dbg.println("[中继] VGA 运行中切换会死循环, 已拒绝");
+          } else {
+            PREVIEW_FRAME = t;
+            ok = camera_change_framesize(t) ? 1 : 0;
+            fs = (int)t;
+            Dbg.printf("[中继] 预览分辨率 -> %c (%s)\n", code, ok ? "OK" : "FAIL");
+          }
+        } else if (lead == 'H' || lead == 'h') {
+          HI_FRAME = framesize_from_code(code);
+          ok = 1; fs = (int)HI_FRAME;
+          Dbg.printf("[中继] 拍照分辨率 -> %c\n", code);
+        }
+      }
+      snprintf(ack, sizeof(ack),
+               "{\"t\":\"cmd_ack\",\"res\":\"%c%c\",\"ok\":%d,\"fs\":%d}",
+               (lead ? lead : '?'), (code ? code : '?'), ok, fs);
+      relay_send_payload((const uint8_t*)ack, strlen(ack));
     }
     // 其余 JSON(reg_ok/error)忽略
   } else if (ok && buf[0] != '{') {

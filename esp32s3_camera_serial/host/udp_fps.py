@@ -31,11 +31,12 @@ CHUNK = 1400 - HDR
 FB_END = b"FRAME_END\n"
 _FRAME = re.compile(rb'FRAME_BEGIN\nSIZE (\d+) (\d+) (\S+)\n(.*?)FRAME_END\n', re.S)
 
-# 命令: q<quality> + v<res> (+ U 仅 udp 模式)
+# 命令: q<quality> + v<res> + U/N (N 必须显式发: 板子 udp_mode 是全局态,
+# 若上次测试开过 U, TCP 模式不发 N 的话板子仍在 UDP 模式, TCP 连接收不到流)
 cmd = b""
 if quality >= 0:
     cmd += b"q" + bytes([quality])
-cmd += ("v" + res).encode() + (b"U" if mode == "udp" else b"")
+cmd += ("v" + res).encode() + (b"U" if mode == "udp" else b"N")
 print(f"模式={mode} 命令: {cmd!r}  (res={res} quality={quality if quality>=0 else '-'})")
 
 

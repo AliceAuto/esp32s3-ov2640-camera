@@ -38,10 +38,32 @@ if r.get("t") != "watch_ok":
     sys.exit(1)
 json.loads(recvmsg(s))  # p2p_peer
 if CMD:
-    cmd = CMD.encode() + b"\x00"
-    s.sendall(len(cmd).to_bytes(4, "big") + cmd)   # 长度前缀封装
-    time.sleep(3.0)   # 等分辨率切换+sensor收敛
-    print(f"[Cmd] 已下发 {CMD!r}")
+    # 可靠 JSON 命令通道: 下发切分辨率并等待摄像头 cmd_ack 回执(结果可判空/可判定)。
+    sendjson(s, {"t": "cmd", "res": CMD, "token": TOKEN})
+    s.settimeout(6.0)
+    deadline = time.time() + 6.0
+    acked = None
+    while time.time() < deadline:
+        try:
+            m = recvmsg(s)
+        except socket.timeout:
+            break
+        except OSError:
+            break
+        try:
+            j = json.loads(m.decode("utf-8"))
+        except Exception:
+            continue
+        if j.get("t") == "cmd_ack" and j.get("res") == CMD:
+            acked = j
+            break
+    if acked is not None:
+        print(f"[Cmd] ACK ok={acked.get('ok')} fs={acked.get('fs')}"
+              + (" (已执行)" if acked.get("ok") else " (被拒/失败)"))
+    else:
+        print("[Cmd] 未收到 ACK(超时), 命令结果未知")
+    s.settimeout(None)
+    time.sleep(2.0)   # 等分辨率切换+sensor收敛
 print(f"[OK] watch {DEV} 建立, 计时 {DUR}s 统计帧数...")
 
 frames = 0

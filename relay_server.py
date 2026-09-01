@@ -205,6 +205,12 @@ class Server:
 
     def handle_json(self, c: Conn, msg: dict):
         t = msg.get("t")
+        # 观众下行命令 / 摄像头命令回执: 可靠 JSON 通道, 直接转发对端。
+        # cmd: 观众 -> 摄像头(切分辨率/拍照分辨率); cmd_ack: 摄像头 -> 观众(执行回执)。
+        if t in ("cmd", "cmd_ack"):
+            if c.peer is not None:
+                c.peer.send_json(msg)
+            return
         # 鉴权: reg/watch 必须携带与服务器一致的 token。
         # 在处理任何业务前拒绝, 未授权的 reg 直接断连(防扫描器反复试探)。
         if self.token and t in ("reg", "watch") and msg.get("token") != self.token:

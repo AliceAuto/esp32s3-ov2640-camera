@@ -14,6 +14,7 @@
 | `rgb2png.py` / `rgb2png_big.py` | RGB565 → PNG 转换 | - |
 | `analyze_frame.py` / `bitcheck.py` | 单帧结构与字节位检查 | - |
 | `sniff_frames.py` / `sniff_com.py` / `cmd_*.py` | 帧/串口/命令嗅探调试 | - |
-| `_diag_*.py` | 一次性诊断脚本（`_` 前缀=临时，保留作取证） | - |
 
-> 说明：这些脚本多为开发期一次性诊断，已不随主程序维护；**生产链路请使用 `../live_capture.py`**。保留于此为论文取证与故障复现参考。原始字节样本 `dump_boot.txt` 亦存档于此。
+> 说明：这些脚本多为开发期一次性诊断，已不随主程序维护；**生产链路请使用 `../live_capture.py`**。
+> 维护记录（2026-09）：`_diag_*.py`（中继/P2P 排障临时脚本）与重复的 `diag_structure.py`、废弃的 `run_preview.bat` 已清理删除；帧协议解析 / RGB565 转换等公共逻辑已收敛到 `../lib/`。
+> 原始字节样本 `dump_boot.txt` 存档于此。
