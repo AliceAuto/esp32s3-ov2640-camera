@@ -8,6 +8,7 @@
 
 | 文档 | 内容 |
 |------|------|
+| [docs/SELECTION.md](docs/SELECTION.md) | 选型论证：OV2640 + ESP32-S3 选型依据与竞品对比 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 体系结构：模块划分、帧流水线、传输通道、任务调度、性能基准 |
 | [docs/SOLUTIONS.md](docs/SOLUTIONS.md) | 问题与解决方案：全部踩坑的根因、诊断与解决（论文级工程复盘） |
 | [INTERVIEW.md](INTERVIEW.md) | 10 道关键技术决策的深度 QA |
