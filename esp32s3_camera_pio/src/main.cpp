@@ -111,6 +111,7 @@ static uint32_t    g_diag_skip_frames = 0;
 // 此前两者混用一个计数器, 且无条件出队导致每帧+1, DIAG 的 skp 完全失去诊断价值。
 static uint32_t    g_diag_evict_frames = 0;
 static uint32_t    g_diag_nc_frames = 0;
+static uint32_t    g_diag_bigdrop_frames = 0;   // 大帧预丢弃(防中继 HOL)
 static uint32_t    g_diag_udp_err = 0;
 static uint32_t    g_diag_udp_retry_ok = 0;
 static int         g_diag_last_err = 0;
@@ -149,6 +150,7 @@ static WiFiClient   relay_cli;
 static SemaphoreHandle_t g_relay_tx  = NULL;     // 保护 relay 发送(信令与帧交错用)
 static volatile bool g_relay_viewer  = false;    // 有观众经中继在观看
 static volatile bool g_relay_online  = false;    // 已连上中继服务端
+static uint16_t    g_relay_stall_ms = 0;        // 上次中继发送的总阻塞时间(ms), 0=无阻塞
 
 // ---- 可靠 P2P 直连: 多候选交叉打洞 + 双向保活 + 三层降级闭环 ----
 // 可靠性设计(对照旧版"单候选单端口, 3s 失败永久放弃"的缺陷):
@@ -731,8 +733,23 @@ void sender_task(void *arg) {
         }
       } else if (g_relay_viewer) {
         // 无本地客户端但有观众经中继在观看 -> 整帧(含 FRAME 头)上行到中继
-        if (send_frame_relay(&shim)) record_sent(t.len);
-        else g_diag_skip_frames++;
+        // I1(大帧防 HOL): XGA/UXGA 大帧(~22KB, 常 >RELAY_BIG_FRAME_LEN)在带宽不足时
+        // 会独占/阻塞整条 TCP 流(见 SOLUTIONS N1), 且一个大帧写不进去时仍占着帧缓冲,
+        // 队列满即顶掉其后的所有小帧 -> 帧率骤降 + 周期断连。这里在**入队阻塞前**就
+        // 预丢弃: 大帧按"背压分片"处理，不整帧占流，留给队列更多并发余量。
+        // 信号: 上次中继发送阻塞时长(g_relay_stall_ms)。上次阻塞 >1s 视为拥塞,
+        // 丢弃当前大帧(计数 bigdrop)，但**小帧照常发送**(小帧单发不产生 HOL)。
+        const uint32_t RELAY_BIG_FRAME_LEN = 8 * 1024;
+        const uint32_t RELAY_STALL_CONGEST_MS = 1000;
+        const bool relay_congested = (g_relay_stall_ms >= RELAY_STALL_CONGEST_MS);
+        if (shim.len > RELAY_BIG_FRAME_LEN && relay_congested) {
+          g_diag_bigdrop_frames++;
+          g_diag_skip_frames++;                  // 与大帧一起计入真丢帧
+        } else if (send_frame_relay(&shim)) {
+          record_sent(t.len);
+        } else {
+          g_diag_skip_frames++;
+        }
       } else {
         g_diag_nc_frames++;
       }
@@ -942,6 +959,7 @@ static bool relay_send_iov(const uint8_t *p0, size_t n0,
   // 直接 break 放弃, 正是造成间歇性垃圾字节 + 帧率不稳的根因。
   bool ok = true;
   uint32_t stall = 0;                 // 连续无进展的毫秒数
+  uint32_t total_stall = 0;           // 本条消息累计"写缓冲满等待"时长(ms), 喂给拥塞判定
   // 发送一段(含 4B 长度头)。s==0 表示 TCP 发送缓冲满/对端慢, 等待再重试;
   // 阻塞超过 ~2s 判定链路已死, 主动断开让上层重连重建(干净复位, 而非留下错位流)。
   auto flush_seg = [&](const uint8_t *p, size_t n) {
@@ -955,6 +973,7 @@ static bool relay_send_iov(const uint8_t *p0, size_t n0,
       }
       // s == 0: 缓冲满, 等腾出再发(只在该段未发完时阻塞, 不忙转)。
       delay(1);
+      total_stall++;                  // I1: 统计最近写阻塞量(供大帧拥塞回避)
       if (++stall >= 2000) {
         ok = false;
         relay_cli.stop();             // 复位连接, 强制重建干净的中继流
@@ -965,6 +984,10 @@ static bool relay_send_iov(const uint8_t *p0, size_t n0,
   if (ok)  flush_seg(hdr, 4);
   for (int i = 0; i < 3 && ok; i++) flush_seg(seg[i], segn[i]);
   xSemaphoreGive(g_relay_tx);
+  // I1: 汇聚"近期中继写阻塞"给 sender_task 的大帧预丢弃 —— 按时间平滑衰减后叠加本次
+  // 阻塞量。send_frame_relay 在拥塞期持续被调, 阻塞量会滚高; 溢出上限 65535 防回绕。
+  uint32_t _semi = ((uint32_t)g_relay_stall_ms * 2u) / 3u + total_stall;
+  g_relay_stall_ms = (_semi > 65535u) ? 65535u : (uint16_t)_semi;
   return ok;
 }
 
@@ -1493,16 +1516,17 @@ void log_diag() {
   uint32_t avg_len = (g_diag_sent_frames > 0) ? (uint32_t)(g_diag_sent_bytes / g_diag_sent_frames) : 0;
   int rssi = WiFi.RSSI();
   // skp=真丢帧(入队失败/发送失败), evc=队列满主动顶掉的最旧帧(背压, 非故障)
-  Dbg.printf("DIAG cap=%.1f/s sent=%.1f/s kb=%.0f/s avg=%uB uerr=%u rty=%u skp=%u evc=%u nc=%u err=%d q=%d auto=%d rssi=%d\n",
+  Dbg.printf("DIAG cap=%.1f/s sent=%.1f/s kb=%.0f/s avg=%uB uerr=%u rty=%u skp=%u evc=%u bgd=%u nc=%u err=%d q=%d auto=%d rssi=%d\n",
              cap_fps, sent_fps, kbps, avg_len,
              g_diag_udp_err, g_diag_udp_retry_ok, g_diag_skip_frames, g_diag_evict_frames,
-             g_diag_nc_frames,
+             g_diag_bigdrop_frames, g_diag_nc_frames,
              g_diag_last_err, g_quality, g_auto_quality ? 1 : 0, rssi);
   g_diag_last_ms = now;
   g_diag_cap_frames = 0;
   g_diag_sent_frames = 0;
   g_diag_skip_frames = 0;
   g_diag_evict_frames = 0;
+  g_diag_bigdrop_frames = 0;
   g_diag_nc_frames = 0;
   g_diag_udp_err = 0;
   g_diag_udp_retry_ok = 0;
@@ -1555,10 +1579,15 @@ void adapt_quality() {
   // 拥塞信号是"发送队列被顶"(evict_delta>0) —— 带宽撑不住才会持续顶最旧帧。
   // 原实现只认 err_delta>0, 纯 TCP 中继下恒为 0, 画质永不下降、帧率被带宽锁死。
   bool congested = (err_delta > 0) || (evict_delta > 0);
+  // I2: 细化步进 —— 按"距目标帧率的偏差"取步进, 偏差大时大步快速追拢, 接近时
+  // 只微调, 避免低带宽链路下固定 ±2 造成的画质锯齿崩摆。上下限(8/35)、判定带宽
+  // (±2/1.5fps)、忙/闲门槛均保持原值, 只改**逐步长占空比**, 不改变收敛终态。
+  float gap = target_fps - fps;                 // >0 落后于目标
+  int step = (gap > 6.0f) ? 6 : (gap > 3.0f) ? 4 : 2;
   if (fps < target_fps - 2.0f && congested && g_quality < 35) {
-    new_q = g_quality + 2;   // 加大压缩 -> 单帧更小 -> 带宽不变时帧率提升
+    new_q = g_quality + step;   // 加大压缩 -> 单帧更小 -> 带宽不变时帧率提升
   } else if (fps > target_fps + 1.5f && !congested && kbps < 650.0f && g_quality > 8) {
-    new_q = g_quality - 1;   // 有余量才回升画质
+    new_q = g_quality - 1;   // 有余量才回画质(逐档, 防过冲)
   }
 
   if (new_q != g_quality) {
