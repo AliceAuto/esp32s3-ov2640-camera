@@ -918,21 +918,36 @@ static bool relay_send_iov(const uint8_t *p0, size_t n0,
   xSemaphoreTake(g_relay_tx, portMAX_DELAY);
   uint8_t hdr[4] = { (uint8_t)(total >> 24), (uint8_t)(total >> 16),
                      (uint8_t)(total >> 8),  (uint8_t)total };
-  relay_cli.write(hdr, 4);
+
+  // 关键: 协议是"4字节大端长度 + 净荷"的长度前缀流。任何一条消息都不允许
+  // 在中间被放弃(长度头已发出但净荷没发完), 否则服务端会把后续所有帧的字节
+  // 误读成这一条的巨型净荷 -> 整个中继流永久错乱(帧率骤降/垃圾字节/卡死),
+  // 只有服务端 45s 超时或摄像头重连 TCP 才能恢复。此前 write()==0(背压)时
+  // 直接 break 放弃, 正是造成间歇性垃圾字节 + 帧率不稳的根因。
   bool ok = true;
-  for (int i = 0; i < 3 && ok; i++) {
+  uint32_t stall = 0;                 // 连续无进展的毫秒数
+  // 发送一段(含 4B 长度头)。s==0 表示 TCP 发送缓冲满/对端慢, 等待再重试;
+  // 阻塞超过 ~2s 判定链路已死, 主动断开让上层重连重建(干净复位, 而非留下错位流)。
+  auto flush_seg = [&](const uint8_t *p, size_t n) {
     size_t off = 0;
-    while (off < segn[i]) {
-      size_t s = relay_cli.write(seg[i] + off, segn[i] - off);
-      if (s == 0) { ok = false; break; }
-      off += s;
-      if (off < segn[i]) {
-        // 仅在发送缓冲区满时延迟; 原实现每次部分写都 delay(1),
-        // 跨网大帧(50KB+)可累积 10-20ms 额外延迟
-        if (relay_cli.availableForWrite() == 0) delay(1);
+    while (off < n) {
+      size_t s = relay_cli.write(p + off, n - off);
+      if (s > 0) {
+        off += s;
+        stall = 0;
+        continue;
+      }
+      // s == 0: 缓冲满, 等腾出再发(只在该段未发完时阻塞, 不忙转)。
+      delay(1);
+      if (++stall >= 2000) {
+        ok = false;
+        relay_cli.stop();             // 复位连接, 强制重建干净的中继流
+        break;
       }
     }
-  }
+  };
+  if (ok)  flush_seg(hdr, 4);
+  for (int i = 0; i < 3 && ok; i++) flush_seg(seg[i], segn[i]);
   xSemaphoreGive(g_relay_tx);
   return ok;
 }
