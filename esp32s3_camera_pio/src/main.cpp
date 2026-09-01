@@ -48,11 +48,15 @@ HardwareSerial Dbg(0);
 #ifdef ENABLE_WIFI   // 凭据/secrets/引脚宏/PIX_FORMAT 定义见 globals.h
 WiFiServer  cam_server(TCP_PORT);
 WiFiClient  cam_client;
+// accept 抢不到 g_cli_mutex 时暂存的新连接: 绝不能让局部变量析构(那会关掉已完成
+// 握手的连接, 而上位机侧显示"已连"并已下发 'U', 固件却无 cam_client -> 永久无流)。
+static WiFiClient g_pending_client;
 WiFiUDP     cam_udp;            // UDP 预览通道(高帧率, 丢帧不重传)   [globals.h extern]
 bool        udp_mode  = false;  // 上位机发 'U' 开启                  [globals.h extern]
 uint16_t    udp_seq   = 0;      // [globals.h extern]
 bool        g_auto_quality = true;   // [globals.h extern]
 uint8_t     g_udp_backoff_frames = 0;   // [globals.h extern]
+volatile bool g_cam_ready = false;   // esp_camera_init 成功置 true [globals.h extern]
 // 诊断/自适应画质统计(g_diag_*/g_adapt_*)在 diag.cpp, 声明见 globals.h
 
 // ---- 局域网自动发现 + 跨网中继客户端 ----
@@ -135,6 +139,7 @@ SemaphoreHandle_t    g_udp_mutex = NULL;   // [globals.h extern]
 SemaphoreHandle_t    g_cli_mutex = NULL;   // 保护 cam_client 的 accept/swap/stop/send [globals.h extern]
 static volatile int  g_inflight   = 0;     // 发送方正持有的帧数(已出队未释放)
 volatile bool        g_switching  = false; // 摄像头重建窗口, 生产侧暂停入队 [globals.h extern]
+volatile uint32_t   g_loop_tick  = 0;     // loop 心跳: sender_task 监控, 卡死则 ESP.restart 自愈
 
 // 发送成功统一记账（DIAG 周期窗口 + 自适应累计两套都递增）
 #endif
@@ -278,9 +283,17 @@ void sender_task(void *arg) {
   camera_fb_t shim;
   IPAddress dst;
   for (;;) {
-    // 等待生产发布新帧; 唤醒后清掉积压计数, 只发"当前最新"一帧(抽帧节拍在此)。
-    if (g_new_frame) xSemaphoreTake(g_new_frame, portMAX_DELAY);
-    xSemaphoreTake(g_snap_mutex, portMAX_DELAY);
+    // 等待新帧; 超时(500ms)醒来检查心跳, 避免 loopTask 卡死时 sender 也永久阻塞
+    if (g_new_frame) xSemaphoreTake(g_new_frame, pdMS_TO_TICKS(500));
+    // loop 心跳看门狗(独立任务监控, 不依赖 task watchdog 配置, 可靠):
+    // loopTask 卡在 esp_camera_fb_get(永久等帧)等处时 g_loop_tick 停更, 5s 触发重启自愈。
+    // 实测 task watchdog 默认不订阅 loopTask 且手动 init 会与框架冲突失效, 改用此方案。
+    if (g_loop_tick && (millis() - g_loop_tick > 5000)) {
+      Dbg.println("[wdt] loopTask 卡死, 重启自愈");
+      delay(100);
+      ESP.restart();
+    }
+    if (!xSemaphoreTake(g_snap_mutex, pdMS_TO_TICKS(50))) continue;  // snap 被占(切分辨率/入队中), 跳过本轮
     // 取最新 ready 槽(释放该槽所有权后本地持有发送), 其余 ready 旧帧丢弃。
     int pick = -1; uint32_t best = 0;
     for (int i = 0; i < SNAP_SLOTS; i++) {
@@ -427,6 +440,7 @@ void setup() {
     while (true) { delay(100); }
   }
   Dbg.println("摄像头初始化成功 (JPEG)");
+  g_cam_ready = true;
   apply_color_calib();
 
 #ifdef ENABLE_WIFI
@@ -452,6 +466,7 @@ void setup() {
   // 若放核1 会抢走 loopTask 的采集与命令实时性。核1 只留给采集+控制, 最大化双核并行。
   xTaskCreatePinnedToCore(disc_task,  "disc",  2048, NULL, 1, NULL, 0); // 局域网发现广播
   xTaskCreatePinnedToCore(relay_task, "relay", 3072, NULL, 1, NULL, 0); // 跨网中继(常驻)
+  xTaskCreatePinnedToCore(diag_beat_task, "diagb", 3072, NULL, 1, NULL, 0); // UDP 诊断心跳(核0)
   g_diag_last_ms = millis();
   g_adapt_last_ms = millis();
 #endif
@@ -1114,6 +1129,7 @@ void handle_cmd(int c, Stream &in) {
 }
 
 void loop() {
+  g_loop_tick = millis();   // 心跳: sender_task 监控, 卡死(如 fb_get 永久等帧)则重启自愈
   log_wifi_ip();
 #ifdef ENABLE_WIFI
   httpServer.handleClient();   // Web 配置页：通过局域网 IP 访问(SoftAP 已关闭)
@@ -1140,6 +1156,24 @@ void loop() {
         cam_client.setTimeout(500);
         xSemaphoreGive(g_cli_mutex);
         Dbg.println("WiFi 客户端接入(抢占)");
+      } else {
+        // 抢锁失败: sender_task 每帧都持该锁发送, 撞上发送窗口很常见。
+        // 原实现让 s 在此析构 -> 关闭新连接, 上位机"已连但无流"(实测 0 fps)。
+        // 暂存后下轮重试接管, 保证新连接不丢。
+        if (g_pending_client) g_pending_client.stop();
+        g_pending_client = s;
+      }
+    }
+    // 接管上一轮暂存的新连接(持续重试直到成功)
+    if (g_pending_client) {
+      if (xSemaphoreTake(g_cli_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (cam_client) cam_client.stop();
+        cam_client = g_pending_client;
+        g_pending_client = WiFiClient();
+        cam_client.setNoDelay(true);
+        cam_client.setTimeout(500);
+        xSemaphoreGive(g_cli_mutex);
+        Dbg.println("WiFi 客户端接入(延迟接管)");
       }
     }
     check_sta_link();

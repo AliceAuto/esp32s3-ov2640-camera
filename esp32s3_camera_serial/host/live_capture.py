@@ -14,6 +14,7 @@ from select import select
 import serial
 from PIL import Image, ImageTk
 import tkinter as tk
+from tkinter import ttk
 from lib import gui_style as Gs
 
 # ---- 传输通道选择 ----

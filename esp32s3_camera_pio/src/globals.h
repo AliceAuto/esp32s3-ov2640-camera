@@ -127,3 +127,4 @@ extern uint64_t g_adapt_last_sent, g_adapt_last_bytes;
 extern uint64_t g_adapt_total_frames, g_adapt_total_bytes;
 extern uint32_t g_adapt_total_err, g_adapt_last_err;
 extern uint64_t g_adapt_total_evict, g_adapt_last_evict;
+extern volatile bool g_cam_ready;   // main.cpp: esp_camera_init 成功置 true

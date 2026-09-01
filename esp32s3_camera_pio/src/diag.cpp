@@ -5,6 +5,7 @@
  *   - adapt_quality: 拥塞自动降画质保帧率, 余量回升
  */
 #include "diag.h"
+#include <ESP.h>   // ESP.getFreeHeap
 
 // ---- 计数与统计窗口 ----
 uint32_t g_diag_last_ms = 0;
@@ -117,14 +118,20 @@ void adapt_quality() {
   const uint16_t RELAY_CONGE_STALL_MS = 300;   // 中继写阻塞累计 0.3s 即视为拥塞
   bool congested = (err_delta > 0) || (evict_delta > 0)
                 || (g_relay_stall_ms > RELAY_CONGE_STALL_MS);
+  // 走公网中继/P2P/TURN 时带宽受限是常态(本机实测跨网上行仅 ~50KB/s, 局域网却
+  // 149KB/s)。自适应"有余量就回画质"会在流畅(已压低)时又把画质拉高 -> 帧率再掉,
+  // 形成画质/帧率反复震荡。跨网路径改为"只降不升": 一旦为流畅压过画质就不再回弹,
+  // 收敛到偏低固定值, 换取稳定帧率。局域网路径(UDP/TCP 直连)保留原回弹逻辑。
+  const bool cross_net = g_turn_mode || g_relay_viewer || g_p2p_active;
   // I2: 细化步进 —— 按"距目标帧率的偏差"取步进, 偏差大时大步快速追拢, 接近时
   // 只微调, 避免低带宽链路下固定 ±2 造成的画质锯齿崩摆。
   float gap = target_fps - fps;                 // >0 落后于目标
   int step = (gap > 6.0f) ? 6 : (gap > 3.0f) ? 4 : 2;
   if (fps < target_fps - 2.0f && congested && g_quality < 35) {
     new_q = g_quality + step;   // 加大压缩 -> 单帧更小 -> 带宽不变时帧率提升
-  } else if (fps > target_fps + 1.5f && !congested && kbps < 650.0f && g_quality > 8) {
-    new_q = g_quality - 1;   // 有余量才回画质(逐档, 防过冲)
+  } else if (!cross_net && fps > target_fps + 1.5f && !congested
+             && kbps < 650.0f && g_quality > 8) {
+    new_q = g_quality - 1;   // 有余量才回画质(逐档, 防过冲) —— 仅局域网
   }
 
   if (new_q != g_quality) {
@@ -139,4 +146,51 @@ void adapt_quality() {
   g_adapt_last_bytes = g_adapt_total_bytes;
   g_adapt_last_err = g_adapt_total_err;
   g_adapt_last_evict = g_adapt_total_evict;
+}
+
+// ---- UDP 诊断心跳 ----
+// 独立于相机产帧: 即使 esp_camera_fb_get 持续失败、sender 无帧可发(0 fps),
+// 也能通过 UDP 把状态上报给最近客户端, 精确定位是"采集失败"还是"发送失败"。
+// 用专用 socket(不与 cam_udp 分帧冲突), 发往最近 cam_client 的 IP:TCP_PORT。
+// 包格式: ASCII 明文, 首字节 'D' 前缀 "DIAG:" 便于上位机区分帧流与诊断包。
+static WiFiUDP diag_udp;
+
+void diag_beat_task(void *arg) {
+  (void)arg;
+  diag_udp.begin(TCP_PORT + 1);   // 独立端口(避与 cam_udp 的 TCP_PORT 冲突)
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(3000));   // 3s 心跳
+    send_diag_beat();
+  }
+}
+
+void send_diag_beat() {
+  if (xSemaphoreTake(g_cli_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+  WiFiClient snap = cam_client;
+  IPAddress dst;
+  bool have = snap && snap.connected();
+  if (have) dst = snap.remoteIP();
+  xSemaphoreGive(g_cli_mutex);
+  if (!have) return;
+
+  char buf[256];
+  int rssi = WiFi.RSSI();
+  int n = snprintf(
+      buf, sizeof(buf),
+      "DIAG:cam_ready=%d cap=%u sent=%u uerr=%u rty=%u skp=%u evc=%u "
+      "nc=%u bgd=%u err=%d q=%d auto=%d rssi=%d udp=%d heap=%u\n",
+      g_cam_ready ? 1 : 0,
+      g_diag_cap_frames, g_diag_sent_frames, g_diag_udp_err, g_diag_udp_retry_ok,
+      g_diag_skip_frames, g_diag_evict_frames, g_diag_nc_frames, g_diag_bigdrop_frames,
+      g_diag_last_err, g_quality, g_auto_quality ? 1 : 0, rssi,
+      udp_mode ? 1 : 0, (unsigned)ESP.getFreeHeap());
+  if (n < 0 || n >= (int)sizeof(buf)) return;
+  // 双通道上报: UDP 专属诊断口(发往客户端 IP) + cam_client 的 TCP 通道。
+  // TCP 通道一定能到达(除非 TCP 接收方不读会被写缓冲, 但诊断稀疏不阻塞预览)。
+  if (snap && snap.connected()) {
+    snap.write((const uint8_t *)buf, n);
+  }
+  diag_udp.beginPacket(dst, TCP_PORT);
+  diag_udp.write((const uint8_t *)buf, n);
+  diag_udp.endPacket();
 }
