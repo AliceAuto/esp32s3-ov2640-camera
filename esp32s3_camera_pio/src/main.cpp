@@ -127,6 +127,10 @@ static uint64_t    g_adapt_total_frames = 0;
 static uint64_t    g_adapt_total_bytes  = 0;
 static uint32_t    g_adapt_total_err    = 0;
 static uint32_t    g_adapt_last_err     = 0;
+// 队列背压(顶掉最旧帧)独立累计: TCP 中继路径没有 UDP 丢包, 帧率上不去的信号是
+// "发送队列持续被顶"(evict), 用它替代 err 触发加大压缩 —— 否则中继帧率永远提不上去。
+static uint64_t    g_adapt_total_evict  = 0;
+static uint64_t    g_adapt_last_evict   = 0;
 
 // ---- 局域网自动发现 + 跨网中继客户端 ----
 #define DISCOVERY_PORT  9999          // 局域网广播发现端口
@@ -629,6 +633,7 @@ void enqueue_frame(camera_fb_t *fb) {
     if (xQueueReceive(g_txq, &victim, 0) == pdTRUE) {
       frame_free(victim.buf, victim.slot);
       g_diag_evict_frames++;             // 背压主动顶帧, 与链路丢帧分开统计
+      g_adapt_total_evict++;             // 独立累计(不被 log_diag 清零), 供 adapt_quality 判拥塞
     }
   }
   if (xQueueSend(g_txq, &t, 0) != pdTRUE) {
@@ -1492,6 +1497,7 @@ void adapt_quality() {
     g_adapt_last_sent  = g_adapt_total_frames;
     g_adapt_last_bytes = g_adapt_total_bytes;
     g_adapt_last_err   = g_adapt_total_err;
+    g_adapt_last_evict = g_adapt_total_evict;
     return;
   }
   if (now - g_adapt_last_ms < 2500) return;
@@ -1500,12 +1506,13 @@ void adapt_quality() {
   uint32_t sent_delta = (uint32_t)(g_adapt_total_frames - g_adapt_last_sent);
   uint64_t bytes_delta = g_adapt_total_bytes - g_adapt_last_bytes;
   uint32_t err_delta   = g_adapt_total_err - g_adapt_last_err;
+  uint32_t evict_delta = (uint32_t)(g_adapt_total_evict - g_adapt_last_evict);
   float fps = sent_delta / dt;
   float kbps = (bytes_delta / 1024.0f) / dt;
   float target_fps;
   if (g_turn_mode || g_relay_viewer) {
-    // 跨网路径 RTT 高、带宽受限, 目标帧率降低, 避免画质频繁震荡
-    target_fps = (cur_frame >= FRAMESIZE_VGA) ? 5.0f : 12.0f;
+    // 跨网路径 RTT 高、带宽受限, 目标帧率低于局域网, 但仍要尽力拉高
+    target_fps = (cur_frame >= FRAMESIZE_VGA) ? 8.0f : 20.0f;
   } else {
     target_fps = (cur_frame >= FRAMESIZE_SVGA) ? 8.0f
                  : (cur_frame >= FRAMESIZE_VGA)  ? 12.0f
@@ -1513,24 +1520,28 @@ void adapt_quality() {
   }
 
   int new_q = g_quality;
-  // 用独立累计的 err_delta 判定: 直接读 g_diag_udp_err 会被 log_diag 每 5s 清零,
-  // 判定结果取决于采样点落在清零前后(时灵时不灵)。
-  if (fps < target_fps - 2.0f && err_delta > 0 && g_quality < 35) {
-    new_q = g_quality + 2;
-  } else if (fps > target_fps + 1.5f && err_delta == 0 && kbps < 650.0f && g_quality > 8) {
-    new_q = g_quality - 1;
+  // 拥塞判定: UDP 路径看发送丢包(err_delta); TCP 中继/TURN 路径没有 UDP 丢包,
+  // 拥塞信号是"发送队列被顶"(evict_delta>0) —— 带宽撑不住才会持续顶最旧帧。
+  // 原实现只认 err_delta>0, 纯 TCP 中继下恒为 0, 画质永不下降、帧率被带宽锁死。
+  bool congested = (err_delta > 0) || (evict_delta > 0);
+  if (fps < target_fps - 2.0f && congested && g_quality < 35) {
+    new_q = g_quality + 2;   // 加大压缩 -> 单帧更小 -> 带宽不变时帧率提升
+  } else if (fps > target_fps + 1.5f && !congested && kbps < 650.0f && g_quality > 8) {
+    new_q = g_quality - 1;   // 有余量才回升画质
   }
 
   if (new_q != g_quality) {
     g_quality = new_q;
     sensor_t *s = esp_camera_sensor_get();
     if (s) s->set_quality(s, g_quality);
-    Dbg.printf("AUTOQ quality=%d fps=%.1f kb=%.0f/s err=%u\n", g_quality, fps, kbps, err_delta);
+    Dbg.printf("AUTOQ quality=%d fps=%.1f kb=%.0f/s err=%u evc=%u\n",
+               g_quality, fps, kbps, err_delta, evict_delta);
   }
   g_adapt_last_ms = now;
   g_adapt_last_sent = g_adapt_total_frames;
   g_adapt_last_bytes = g_adapt_total_bytes;
   g_adapt_last_err = g_adapt_total_err;
+  g_adapt_last_evict = g_adapt_total_evict;
 }
 #endif
 
