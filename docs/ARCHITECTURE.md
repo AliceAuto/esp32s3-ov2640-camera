@@ -1,7 +1,7 @@
 # OV2640 + ESP32-S3 无线摄像头系统 — 体系结构
 
 > 本文档描述系统的总体架构、模块划分、帧流水线、传输通道与关键机制，是论文与技术交接的体系级参考。
-> 器件选型依据（OV2640 / ESP32-S3）见 [SELECTION.md](./SELECTION.md)；问题根因与解决见 [SOLUTIONS.md](./SOLUTIONS.md)。
+> 器件选型依据（OV2640 / ESP32-S3）见 [SELECTION.md](./SELECTION.md)；问题根因与解决见 [SOLUTIONS.md](./SOLUTIONS.md)；已识别取舍的分类（可落地改进 / 需换约束）见 [SOLUTIONS.md 六、局限性 / 未来工作](./SOLUTIONS.md)。
 
 ---
 
