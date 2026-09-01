@@ -18,42 +18,20 @@
  *
  * 编译/烧录：pio run && pio run -t upload（COM7）
  */
-#include "esp_camera.h"
-#include <WiFi.h>
-#include <WiFiServer.h>
-#include <WiFiUdp.h>
-#include <WebServer.h>
-#include <Preferences.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "esp_heap_caps.h"
-
-// ---- 像素格式：本工程专为解锁 JPEG ----
-#define PIX_FORMAT PIXFORMAT_JPEG   // JPEG（源库编译），改回 PIXFORMAT_RGB565 即旧基线
+#include "globals.h"        // 常量 + 跨模块共享全局(见 globals.h 拆分说明)
+#include "diag.h"           // 诊断统计 / 自适应画质
+#include "discovery.h"      // 局域网广播发现
+#include "frame_pool.h"     // PSRAM 帧内存池
+#include "camera.h"         // 相机管理
+#include "frame_io.h"       // 帧收发(OVU/TCP/串口)
+#include "web_cfg.h"        // Web 配置页 + NVS
+#include "wifi_sta.h"       // WiFi STA 接入
 
 // ---- 函数原型（.ino 由 Arduino 自动生成，.cpp 需手动声明）----
-int fb_count_for(framesize_t fs);
-bool send_frame(camera_fb_t *fb);
-void send_frame_serial(camera_fb_t *fb);
-framesize_t framesize_from_code(char code);
-void apply_color_calib();
-bool init_camera_as(framesize_t target, framesize_t fallback);
-bool camera_reconnect();
-bool camera_change_framesize(framesize_t fs);
-void setup_wifi();
-void log_wifi_ip();
-void check_sta_link();
-void log_diag();
-void adapt_quality();
 void handle_cmd(int c, Stream &in);
 void enqueue_frame(camera_fb_t *fb);
 void wait_tx_idle(uint32_t timeout_ms);
 void sender_task(void *arg);
-void handle_web_root();
-void handle_web_save();
-void disc_task(void *arg);
 void relay_task(void *arg);
 bool send_frame_relay(camera_fb_t *fb);
 bool send_frame_udp_via_turn(camera_fb_t *fb);
@@ -62,95 +40,31 @@ void ice_poll();
 void turn_keepalive();
 static void p2p_socks_init();
 static void p2p_reset();
-String default_dev_id();
 
 // UART0 = CH343 转串口所在通道（TX=GPIO43, RX=GPIO44），避免默认 Serial 走 USB-CDC。
 HardwareSerial Dbg(0);
 
 // ---- WiFi 传输（纯 STA 连入局域网 + TCP 服务端；SoftAP 仅在无凭据时兜底配网）----
-#define ENABLE_WIFI 1
-#ifdef ENABLE_WIFI
-// 凭据不入库：建本地文件 src/secrets.h 覆盖（已在 .gitignore）。
-//   #define STA_SSID "你的SSID"
-//   #define STA_PASS "你的密码"
-// 未定义时留空 -> setup_wifi() 检测无凭据会开 SoftAP 兜底，保证配网页(:80)可达。
-// 正常运行凭据来自 NVS：配网页保存过一次后即持久化，重启自动重连。
-#if __has_include("secrets.h")
-#include "secrets.h"
-#endif
-#ifndef STA_SSID
-#define STA_SSID   ""
-#endif
-#ifndef STA_PASS
-#define STA_PASS   ""
-#endif
-#define AP_SSID    "OV2640Cam"         // 兜底热点(仅在无 STA 凭据时开启)
-#define AP_PASS    ""
-#define TCP_PORT   3333
-static WiFiServer  cam_server(TCP_PORT);
-static WiFiClient  cam_client;
-static uint32_t    g_last_ip_log = 0;
-static bool        g_softap_on   = false;   // 兜底热点是否已开(保存凭据后需关闭)
-
-// ---- Web 配置页 + 目标 WiFi(NVS) ----
-static char        g_sta_ssid[33] = STA_SSID;   // 运行时 STA 目标(可在配网页覆盖并持久化)
-static char        g_sta_pass[64] = STA_PASS;
-static Preferences g_prefs;
-static WebServer   httpServer(80);
-
-static WiFiUDP     cam_udp;            // UDP 预览通道(高帧率, 丢帧不重传)
-static bool        udp_mode  = false;  // 上位机发 'U' 开启
-static uint16_t    udp_seq   = 0;
-static bool        g_auto_quality = true;
-static uint8_t     g_udp_backoff_frames = 0;
-static uint32_t    g_diag_last_ms = 0;
-static uint32_t    g_diag_cap_frames = 0;
-static uint32_t    g_diag_sent_frames = 0;
-static uint32_t    g_diag_skip_frames = 0;
-// 队列满时主动顶掉的最旧帧(背压), 与 g_diag_skip_frames(真丢帧)分开统计。
-// 此前两者混用一个计数器, 且无条件出队导致每帧+1, DIAG 的 skp 完全失去诊断价值。
-static uint32_t    g_diag_evict_frames = 0;
-static uint32_t    g_diag_nc_frames = 0;
-static uint32_t    g_diag_bigdrop_frames = 0;   // 大帧预丢弃(防中继 HOL)
-static uint32_t    g_diag_udp_err = 0;
-static uint32_t    g_diag_udp_retry_ok = 0;
-static int         g_diag_last_err = 0;
-static uint64_t    g_diag_sent_bytes = 0;
-static uint64_t    g_diag_cap_bytes = 0;
-static uint32_t    g_adapt_last_ms = 0;
-static uint64_t    g_adapt_last_sent = 0;
-static uint64_t    g_adapt_last_bytes = 0;
-// 自适应画质用独立累计计数：log_diag 每5s清零 g_diag_*，统计窗不同不能共用，
-// 否则差分遇到清零会产生下溢/0值，画质调节半失效。
-// 注意：UDP 错误计数同样必须独立累计（此前漏了，adapt_quality 直接读 g_diag_udp_err，
-// 该值被 log_diag 每5s清零，判定结果取决于采样点落在清零前后，时灵时不灵）。
-static uint64_t    g_adapt_total_frames = 0;
-static uint64_t    g_adapt_total_bytes  = 0;
-static uint32_t    g_adapt_total_err    = 0;
-static uint32_t    g_adapt_last_err     = 0;
-// 队列背压(顶掉最旧帧)独立累计: TCP 中继路径没有 UDP 丢包, 帧率上不去的信号是
-// "发送队列持续被顶"(evict), 用它替代 err 触发加大压缩 —— 否则中继帧率永远提不上去。
-static uint64_t    g_adapt_total_evict  = 0;
-static uint64_t    g_adapt_last_evict   = 0;
+#ifdef ENABLE_WIFI   // 凭据/secrets/引脚宏/PIX_FORMAT 定义见 globals.h
+WiFiServer  cam_server(TCP_PORT);
+WiFiClient  cam_client;
+WiFiUDP     cam_udp;            // UDP 预览通道(高帧率, 丢帧不重传)   [globals.h extern]
+bool        udp_mode  = false;  // 上位机发 'U' 开启                  [globals.h extern]
+uint16_t    udp_seq   = 0;      // [globals.h extern]
+bool        g_auto_quality = true;   // [globals.h extern]
+uint8_t     g_udp_backoff_frames = 0;   // [globals.h extern]
+// 诊断/自适应画质统计(g_diag_*/g_adapt_*)在 diag.cpp, 声明见 globals.h
 
 // ---- 局域网自动发现 + 跨网中继客户端 ----
-#define DISCOVERY_PORT  9999          // 局域网广播发现端口
-#define RELAY_HOST_DEFAULT "8.148.79.85:8001"   // 未配置时默认连接的公网中继服务端(空=关闭)
-#ifndef RELAY_TOKEN
-#define RELAY_TOKEN ""                          // 中继鉴权口令, secrets.h 可覆盖(与服务器一致)
-#endif
-static WiFiUDP      disc_udp;
-static uint32_t     g_disc_last_ms = 0;
-
-static char         g_dev_name[32]   = AP_SSID;  // 广播/注册用设备名(可在配网页改)
-static char         g_dev_id[40]     = "";       // 注册 id(默认 cam-<MAC后4字节>)
-static char         g_relay_host[80] = "";       // 中继服务端 "host:port", 空=关闭
-static char         g_relay_token[40]= "";       // 中继鉴权口令(reg/watch 必须携带)
+char            g_dev_name[32]   = AP_SSID;  // 广播/注册用设备名 [globals.h extern]
+char            g_dev_id[40]     = "";       // 注册 id(默认 cam-<MAC后4字节>) [extern]
+char            g_relay_host[80] = "";       // 中继服务端 "host:port", 空=关闭 [extern]
+char            g_relay_token[40]= "";       // 中继鉴权口令(reg/watch 必须携带) [extern]
 static WiFiClient   relay_cli;
 static SemaphoreHandle_t g_relay_tx  = NULL;     // 保护 relay 发送(信令与帧交错用)
-static volatile bool g_relay_viewer  = false;    // 有观众经中继在观看
-static volatile bool g_relay_online  = false;    // 已连上中继服务端
-static uint16_t    g_relay_stall_ms = 0;        // 上次中继发送的总阻塞时间(ms), 0=无阻塞
+volatile bool    g_relay_viewer  = false;    // 有观众经中继在观看 [globals.h extern]
+volatile bool    g_relay_online  = false;    // 已连上中继服务端 [globals.h extern]
+volatile uint16_t  g_relay_stall_ms = 0;        // 中继 TCP 写阻塞滚动量(ms), 0=无阻塞 [globals.h extern]
 
 // ---- 可靠 P2P 直连: 多候选交叉打洞 + 双向保活 + 三层降级闭环 ----
 // 可靠性设计(对照旧版"单候选单端口, 3s 失败永久放弃"的缺陷):
@@ -160,15 +74,7 @@ static uint16_t    g_relay_stall_ms = 0;        // 上次中继发送的总阻�
 //   3. 直连后双向 500ms keepalive, 双向维持 NAT 映射(旧版只有观众单向发)。
 //   4. 降级链闭环: 直连失活->TURN; TURN 失活->TCP 中继; 期间周期重试打洞恢复直连。
 //      旧版 TURN 优先级高于 TCP 且失败不可检测, 观众退出后会一直往死端点发帧。
-#define P2P_NSOCK      3                  // 本端候选 socket 数([0]=cam_udp 主口)
-#define P2P_NPEER_MAX  4                  // 对端候选数上限(服务器下发 cands)
-#define P2P_MAGIC      "P2P"              // 打洞/保活包 magic(3B)
-#define P2P_PUNCH_MS   100                // 打洞发包周期
-#define P2P_PUNCH_TMO  3000               // 单轮打洞超时(超时切 TURN, 但保留候选重试)
-#define P2P_KEEPALIVE_MS 500              // 直连保活周期
-#define P2P_DEAD_MS    3000               // 直连失活判定(多久没收到对端包)
-#define P2P_TURN_DEAD_MS 5000             // TURN 失活判定(观众 socket 已关, 降 TCP)
-#define P2P_RETRY_MS   30000              // 走 TURN/TCP 期间重试打洞周期
+// P2P 常量(P2P_NSOCK/P2P_NPEER_MAX/P2P_MAGIC/...) 定义见 globals.h
 static WiFiUDP*      g_p2p_udp[P2P_NSOCK] = {NULL, NULL, NULL};  // [0]=&cam_udp
 static IPAddress     g_p2p_peer_ipN[P2P_NPEER_MAX];   // 对端候选表(打洞目标)
 static uint16_t      g_p2p_peer_portN[P2P_NPEER_MAX] = {0};
@@ -176,12 +82,12 @@ static int           g_p2p_npeer = 0;            // 有效对端候选数
 static volatile int8_t g_p2p_lock_sock = -1;     // 打洞成功锁定的本端 socket 索引
 static IPAddress     g_p2p_lock_ip;              // 锁定的对端端点(视频发往此处)
 static uint16_t      g_p2p_lock_port = 0;
-static volatile bool g_p2p_active = false;       // P2P 直连已建立(视频走 UDP 直连)
+volatile bool        g_p2p_active = false;       // P2P 直连已建立 [globals.h extern]
 static uint32_t      g_p2p_punch_ms = 0;         // 上次打洞/保活发包时间
 static uint32_t      g_p2p_punch_start = 0;      // 本轮打洞开始时间
 static uint32_t      g_p2p_next_retry = 0;       // 下次重试打洞时刻(降级后周期恢复)
 static uint32_t      g_p2p_last_rx = 0;          // 最近收到对端包的时刻(存活判定)
-static volatile bool g_turn_mode    = false;     // TURN 兜底(帧经服务器转向观众)
+volatile bool        g_turn_mode    = false;     // TURN 兜底 [globals.h extern]
 static uint32_t      g_turn_last_stun = 0;       // 上次 STUN 保活刷新时间
 static bool          g_p2p_socks_ready = false;  // 候选 socket 是否已创建
 
@@ -222,63 +128,15 @@ static volatile uint32_t g_slot_seq[SNAP_SLOTS] = {0, 0};  // 每槽最近一次
 // 排空都会操作同一个 WiFiUDP 对象。lwIP socket 与 WiFiUDP 内部状态均非线程安全,
 // 且两者同核, 高优先级 sender 可在 relay 执行 beginPacket 期间抢占 -> 状态错乱。
 // TURN 提前开启后并发窗口显著变大, 必须串行化。
-static SemaphoreHandle_t   g_udp_mutex = NULL;
+SemaphoreHandle_t    g_udp_mutex = NULL;   // [globals.h extern]
 
 // ---- 帧内存池：消除每帧 PSRAM malloc/free 的抖动与碎片 ----
-// 改造前采集侧每帧一次 heap_caps_malloc、发送侧一次 heap_caps_free，30fps 即每秒
-// 30 次 PSRAM 分配/释放，且帧长随场景变化极易产生碎片。定长块池化后分配退化为
-// 一次队列出队（跨任务安全、零碎片）；超过块长的特大帧回退堆分配，行为不变。
-#define FB_POOL_BLOCKS 6
-#define FB_POOL_BLOCK  (64 * 1024)    // 覆盖 QVGA~UXGA 全部 JPEG 帧(48K 不够覆盖 UXGA 极端帧)
-static uint8_t      *g_pool_mem  = NULL;
-static QueueHandle_t g_pool_free = NULL;   // 空闲块索引
-
-static bool frame_pool_init() {
-  g_pool_mem = (uint8_t*)heap_caps_malloc((size_t)FB_POOL_BLOCKS * FB_POOL_BLOCK,
-                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!g_pool_mem) return false;
-  g_pool_free = xQueueCreate(FB_POOL_BLOCKS, sizeof(int));
-  if (!g_pool_free) { heap_caps_free(g_pool_mem); g_pool_mem = NULL; return false; }
-  for (int i = 0; i < FB_POOL_BLOCKS; i++) {
-    int idx = i;
-    xQueueSend(g_pool_free, &idx, 0);
-  }
-  return true;
-}
-// 取一块；无空闲/未初始化返回 -1(调用方回退堆分配)
-static int frame_pool_take() {
-  int idx;
-  if (!g_pool_free) return -1;
-  return (xQueueReceive(g_pool_free, &idx, 0) == pdTRUE) ? idx : -1;
-}
-static void frame_pool_give(int idx) {
-  if (idx >= 0 && g_pool_free) xQueueSend(g_pool_free, &idx, 0);
-}
-// 分配一帧缓冲：优先池化块，超大帧回退 PSRAM 堆
-static uint8_t *frame_alloc(size_t len, int8_t *slot) {
-  if (g_pool_mem && len <= FB_POOL_BLOCK) {
-    int idx = frame_pool_take();
-    if (idx >= 0) { *slot = (int8_t)idx; return g_pool_mem + (size_t)idx * FB_POOL_BLOCK; }
-  }
-  *slot = -1;
-  return (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-}
-static void frame_free(uint8_t *p, int8_t slot) {
-  if (!p) return;
-  if (slot >= 0) frame_pool_give((int)slot);
-  else heap_caps_free(p);
-}
-static SemaphoreHandle_t   g_cli_mutex = NULL;   // 保护 cam_client 的 accept/swap/stop/send
-static volatile int        g_inflight   = 0;     // 发送方正持有的帧数(已出队未释放)
-static volatile bool       g_switching  = false; // 摄像头重建窗口, 生产侧暂停入队
+// frame_pool_init/frame_alloc/frame_free 已拆到 frame_pool.cpp
+SemaphoreHandle_t    g_cli_mutex = NULL;   // 保护 cam_client 的 accept/swap/stop/send [globals.h extern]
+static volatile int  g_inflight   = 0;     // 发送方正持有的帧数(已出队未释放)
+volatile bool        g_switching  = false; // 摄像头重建窗口, 生产侧暂停入队 [globals.h extern]
 
 // 发送成功统一记账（DIAG 周期窗口 + 自适应累计两套都递增）
-static void record_sent(size_t len) {
-  g_diag_sent_frames++;
-  g_diag_sent_bytes   += len;
-  g_adapt_total_frames++;
-  g_adapt_total_bytes += len;
-}
 #endif
 
 // ---- 引脚配置（esp32-camera 官方 ESP32-S3 示例，含损坏脚位移位）----
@@ -303,197 +161,19 @@ static void record_sent(size_t len) {
 #define TX_GPIO_NUM    43
 #define RX_GPIO_NUM    44
 
-// ---- 帧头/帧尾（上位机识别帧边界）----
-static const char FRAME_BEGIN[] = "FRAME_BEGIN\n";
-static const char FRAME_END[]   = "FRAME_END\n";
-
-// 运行时可切换的分辨率
-static framesize_t PREVIEW_FRAME = FRAMESIZE_QVGA;   // 预览 320x240（30fps，OV2640 CIF 模式甜点）
-static framesize_t HI_FRAME      = FRAMESIZE_UXGA;   // 拍照 1600x1200
-static framesize_t cur_frame     = FRAMESIZE_QVGA;
-static int         g_quality     = 16;   // JPEG 质量(0-63, 值越大压缩越强文件越小).
+// ---- 运行时可切换的分辨率 [均 globals.h extern] ----
+framesize_t PREVIEW_FRAME = FRAMESIZE_QVGA;   // 预览 320x240（30fps，OV2640 CIF 模式甜点）
+framesize_t HI_FRAME      = FRAMESIZE_UXGA;   // 拍照 1600x1200
+framesize_t cur_frame     = FRAMESIZE_QVGA;
+int         g_quality     = 16;   // JPEG 质量(0-63, 值越大压缩越强文件越小).
 // 帧率优先策略: 默认升至16在 QVGA 下每帧量约减半, 跨网带宽受限时帧率近翻倍, QVGA画质损失轻微。
 // 注意: QVGA(CIF模式)下 quality 太低(如2)会卡死无帧(传感器编码bug), 16 在此安全区间内且比10更抗带宽。
 //       VGA(SVGA模式)下可运行时 'q2' 提画质(实测 15fps + 55KB/帧) 不损失帧率.
 
-// 摄像头配置全局保存，供失锁后 deinit+reinit 复用
-static camera_config_t g_config;
+// g_config(摄像头配置)定义在 camera.cpp; 帧头/帧尾(FRAME_BEGIN/END)定义在 frame_io.cpp;
+// BYTES_PER_PIXEL/MAX_FB_BYTES 见 globals.h
 
-// JPEG 模式下每帧字节数不定，缓冲预算按 RGB 等价量估算，防 PSRAAM OOM
-#define BYTES_PER_PIXEL 2
-#define MAX_FB_BYTES (6 * 1024 * 1024)   // 6MB
-
-// 依据分辨率自适应双缓冲数量（大图降为1，防 PSRAM OOM 卡死）
-int fb_count_for(framesize_t fs) {
-  if (fs < 0 || fs >= FRAMESIZE_INVALID) return 1;
-  int w = resolution[fs].width;
-  int h = resolution[fs].height;
-  int64_t one = (int64_t)w * h * BYTES_PER_PIXEL;
-  int64_t two = one * 2;
-  if (two <= MAX_FB_BYTES) return 2;
-  return 1;
-}
-
-// 发送一帧原始数据（带尺寸头）。仅在持有 g_cli_mutex 时调用。
-// 失败返回 false 并重置客户端（P 拍照路径据此回退串口补发）。
-static bool send_frame_locked(camera_fb_t *fb) {
-  if (!(cam_client && cam_client.connected())) { g_diag_nc_frames++; return false; }
-  cam_client.write((const uint8_t*)FRAME_BEGIN, sizeof(FRAME_BEGIN) - 1);
-  char head[48];
-  snprintf(head, sizeof(head), "SIZE %u %u %s\n", fb->width, fb->height,
-           (fb->format == PIXFORMAT_JPEG) ? "JPG" : "RGB");
-  cam_client.write((const uint8_t*)head, strlen(head));
-  const uint8_t *p = fb->buf; size_t left = fb->len;
-  bool tcp_ok = true;
-  while (left) {
-    size_t n = left > 16384 ? 16384 : left;
-    size_t s = cam_client.write(p, n);
-    if (s == 0) { tcp_ok = false; break; }
-    p += s; left -= s;
-    if (left) yield();
-  }
-  if (tcp_ok) {
-    cam_client.write((const uint8_t*)FRAME_END, sizeof(FRAME_END) - 1);
-    return true;
-  }
-  Dbg.println("TCP 发送失败, 丢帧并重置客户端");
-  cam_client.stop();
-  g_diag_skip_frames++;
-  g_diag_last_err = -2;
-  return false;
-}
-
-// 对外包装：拍照等 loop 侧调用加锁后复用同一实现
-bool send_frame(camera_fb_t *fb) {
-#ifdef ENABLE_WIFI
-  if (xSemaphoreTake(g_cli_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
-  bool ok = send_frame_locked(fb);
-  xSemaphoreGive(g_cli_mutex);
-  return ok;
-#else
-  send_frame_serial(fb);
-  return true;
-#endif
-}
-
-// 强制通过串口发送帧（不受 WiFi 客户端状态影响）。用于 P 拍照的兜底路径。
-void send_frame_serial(camera_fb_t *fb) {
-  Dbg.write(FRAME_BEGIN, sizeof(FRAME_BEGIN) - 1);
-  Dbg.printf("SIZE %u %u %s\n", fb->width, fb->height,
-             (fb->format == PIXFORMAT_JPEG) ? "JPG" : "RGB");
-  Dbg.write(fb->buf, fb->len);
-  Dbg.write(FRAME_END, sizeof(FRAME_END) - 1);
-}
-
-#ifdef ENABLE_WIFI
-// ---- OVU 分片协议公共定义 ----
-// 局域网直发(send_frame_udp) 与 TURN 转向(send_frame_udp_via_turn) 共用，
-// 此前两处各写一份分片逻辑且已发生漂移(turn 路径漏了逐片重试)，改协议极易漏改。
-//   头: "OVU"(3) fmt(1) seq(2) cnt_minus1(1) idx(1) w(2) h(2)  fmt:0=RGB565 1=JPEG
-#define OVU_HDR         12
-#define OVU_CHUNK       (1400 - OVU_HDR)   // 单报文净荷, 整包 1400B 避开 MTU 分片
-#define OVU_MAX_CHUNKS  250                // idx/cnt 是 u8
-
-// 组装分片头；hdr[7](idx) 由调用方逐片填
-static inline void ovu_build_header(uint8_t *hdr, pixformat_t fmt, uint16_t seq,
-                                    size_t nchunk, uint16_t w, uint16_t h) {
-  hdr[0] = 'O'; hdr[1] = 'V'; hdr[2] = 'U';
-  hdr[3] = (fmt == PIXFORMAT_JPEG) ? 1 : 0;
-  hdr[4] = (uint8_t)(seq >> 8);
-  hdr[5] = (uint8_t)(seq & 0xFF);
-  hdr[6] = (uint8_t)(nchunk - 1);
-  hdr[7] = 0;
-  hdr[8]  = (uint8_t)(w >> 8);
-  hdr[9]  = (uint8_t)(w & 0xFF);
-  hdr[10] = (uint8_t)(h >> 8);
-  hdr[11] = (uint8_t)(h & 0xFF);
-}
-static inline size_t ovu_chunk_count(size_t len) {
-  size_t n = (len + OVU_CHUNK - 1) / OVU_CHUNK;
-  if (n == 0) n = 1;
-  return n > OVU_MAX_CHUNKS ? OVU_MAX_CHUNKS : n;
-}
-
-// 通过 UDP 把一整帧分片成多个数据报发送（预览用，丢帧不重传）。
-// 优化1: 头+净荷先在栈上拼成连续报文再单次 write。此前两次 write 会让 lwIP
-//        生成链式 pbuf(两次分配+拷贝)，每帧 4~36 片 = 每帧数十次额外开销。
-// 优化2: 重试改为整帧共享预算。此前小帧 6 次重试×2ms×最多4片 = 最坏阻塞 48ms
-//        (注释写 8ms 与实际不符)，期间 sender_task 停止消费队列。
-static bool send_frame_udp_locked(camera_fb_t *fb, WiFiUDP &u, IPAddress dst, uint16_t port) {
-  const uint8_t *buf = fb->buf;
-  size_t len = fb->len;
-  size_t nchunk = ovu_chunk_count(len);
-  uint8_t pkt[OVU_HDR + OVU_CHUNK];          // 1400B 拼包缓冲(单次 write)
-  ovu_build_header(pkt, (pixformat_t)fb->format, udp_seq, nchunk, fb->width, fb->height);
-
-  const bool small_frame     = (nchunk <= 4);
-  const int  max_retry       = small_frame ? 6 : 1;
-  const int  retry_delay_ms  = small_frame ? 2 : 1;
-  const int  retry_budget_ms = small_frame ? 6 : 3;    // 整帧重试总预算(ms), 小帧 10->6 减少队列阻塞
-  int budget_used = 0;
-  size_t off = 0;
-  for (size_t i = 0; i < nchunk && off < len; i++) {
-    size_t n = len - off;
-    if (n > OVU_CHUNK) n = OVU_CHUNK;
-    pkt[7] = (uint8_t)i;
-    memcpy(pkt + OVU_HDR, buf + off, n);
-    bool sent = false;
-    for (int t = 0; t <= max_retry; t++) {
-      u.beginPacket(dst, port);
-      u.write(pkt, OVU_HDR + n);
-      int rc = u.endPacket();
-      if (rc == 1) {
-        if (t > 0) g_diag_udp_retry_ok++;
-        sent = true;
-        break;
-      }
-      g_diag_udp_err++;
-      g_adapt_total_err++;
-      g_diag_last_err = -1;
-      if (t >= max_retry || budget_used >= retry_budget_ms) break;
-      delay(retry_delay_ms);
-      budget_used += retry_delay_ms;
-    }
-    if (!sent) {
-      g_diag_skip_frames++;
-      if (!small_frame) g_udp_backoff_frames = 3;
-      return false;
-    }
-    off += n;
-  }
-  udp_seq++;
-  return true;
-}
-
-// 发送入口。socket 参数化: 局域网/TURN 用 cam_udp(需与 relay_task 的打洞互斥),
-// P2P 直连用打洞锁定的候选 socket([1..2] 为独占口, 无并发, 不加锁不阻塞)。
-bool send_frame_udp(camera_fb_t *fb, WiFiUDP &u, IPAddress dst, uint16_t port = TCP_PORT) {
-  bool shared = (&u == &cam_udp);
-  if (shared) {
-    if (!g_udp_mutex) return false;
-    if (xSemaphoreTake(g_udp_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-      g_diag_skip_frames++;              // 拿不到锁(打洞中), 宁丢一帧不并发
-      return false;
-    }
-  }
-  bool ok = send_frame_udp_locked(fb, u, dst, port);
-  if (shared) xSemaphoreGive(g_udp_mutex);
-  return ok;
-}
-#endif
-
-// 分辨率字符码 -> framesize_t。q=QQVGA,t=QVGA,v=VGA,s=SVGA,x=XGA,u=UXGA
-framesize_t framesize_from_code(char code) {
-  switch (code) {
-    case 'q': return FRAMESIZE_QQVGA;
-    case 't': return FRAMESIZE_QVGA;
-    case 'v': return FRAMESIZE_VGA;
-    case 's': return FRAMESIZE_SVGA;
-    case 'x': return FRAMESIZE_XGA;
-    case 'u': return FRAMESIZE_UXGA;
-    default:  return FRAMESIZE_QQVGA;
-  }
-}
+// 帧收发(TCP/串口/OVU 分片)已拆到 frame_io.cpp; fb_count_for/framesize_from_code 在 camera.cpp
 
 // 中继 JSON 下行命令 {"t":"cmd","res":"Vx"} / {"t":"cmd","res":"Hx"} 解析。
 // 返回命令首字母('V'/'H', 兼容小写), code 回填分辨率码; 格式非法返回 0。
@@ -517,29 +197,10 @@ static char relay_cmd_lead(const char *s, char &code) {
   return lead;
 }
 
-// 每次 reinit 后重设传感器画质参数（deinit+init 会复位寄存器）
-void apply_color_calib() {
-  sensor_t *s = esp_camera_sensor_get();
-  if (!s) { Dbg.println("警告：获取 sensor 失败"); return; }
-  s->set_whitebal(s, 1);      // AWB
-  s->set_gain_ctrl(s, 1);     // AGC
-  s->set_exposure_ctrl(s, 1);
-  // JPEG 质量(0-63, 越小画质越高文件越大), 运行时 'q' 命令可调
-  s->set_quality(s, g_quality);
-  uint8_t clkrc_init = (uint8_t)s->get_reg(s, 0x0011, 0xFF);
-  Dbg.printf("CLKRC init=0x%02X\n", clkrc_init);
-  delay(200);                 // 给 AWB/AGC 收敛时间
-}
-
+// apply_color_calib / cam_lock / cam_unlock 已拆到 camera.cpp
+// g_cam_mutex: 相机互斥锁对象, 由 setup 创建, 声明见 globals.h
+SemaphoreHandle_t g_cam_mutex = NULL;
 #ifdef ENABLE_WIFI
-// 相机驱动互斥锁: deinit/init 重建与采集(fb_get/fb_return) 分处不同核(中继命令在核0、
-// 采集 loop 在核1), 双核并发访问 cam_obj 会在 deinit 释放后仍在 fb_get/return 引用
-// → use-after-free 卡死(与分辨率无关, 切任意都卡)。所有 esp_camera_* 调用必须以它串行化。
-static SemaphoreHandle_t g_cam_mutex = NULL;
-static bool cam_lock(uint32_t timeout_ms) {
-  return g_cam_mutex && xSemaphoreTake(g_cam_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
-}
-static void cam_unlock() { if (g_cam_mutex) xSemaphoreGive(g_cam_mutex); }
 // 等待发送侧不再持有任何帧且在途帧归零。必须在任何 esp_camera_deinit/改分辨率前调用：
 // 快照里存的是已从相机驱动拷出的 PSRAM 内存，切换本身安全，
 // 但若在途帧还被 sender 引用就 deinit 会改变后续 fb 语义 —— 排空保证无竞争窗口。
@@ -560,115 +221,8 @@ void wait_tx_idle(uint32_t timeout_ms) {
 }
 #endif
 
-// 以目标分辨率重建摄像头（失败自动降级：先单缓冲，再回退 fallback）
-bool init_camera_as(framesize_t target, framesize_t fallback) {
-  g_config.frame_size = target;
-  g_config.fb_count   = fb_count_for(target);
-  esp_err_t err = esp_camera_init(&g_config);
-  if (err == ESP_OK) {
-    cur_frame = target;
-    Dbg.printf("摄像头初始化: fs=%u fb=%d\n", (unsigned)target, g_config.fb_count);
-    apply_color_calib();
-    return true;
-  }
-  Dbg.printf("init fs=%u 失败 err=0x%x, 尝试单缓冲...\n", (unsigned)target, err);
-  // 失败的 init 可能残留传感器/DMA/SCCB 状态，必须先 deinit 再重试，
-  // 否则二次 init 大概率同样失败，会被误判为内存不足而错误降级
-  esp_camera_deinit();
-  delay(100);
-  g_config.fb_count = 1;
-  err = esp_camera_init(&g_config);
-  if (err == ESP_OK) {
-    cur_frame = target;
-    Dbg.printf("摄像头初始化(单缓冲): fs=%u fb=1\n", (unsigned)target);
-    apply_color_calib();
-    return true;
-  }
-  Dbg.printf("单缓冲也失败 err=0x%x, 回退 fs=%u\n", err, (unsigned)fallback);
-  esp_camera_deinit();
-  delay(100);
-  g_config.frame_size = fallback;
-  g_config.fb_count   = fb_count_for(fallback);
-  err = esp_camera_init(&g_config);
-  if (err == ESP_OK) {
-    cur_frame = fallback;
-    Dbg.printf("已回退到 fs=%u\n", (unsigned)fallback);
-    apply_color_calib();
-    return true;
-  }
-  Dbg.printf("回退也失败 err=0x%x\n", err);
-  return false;
-}
-
-// 失锁后重新初始化（先 deinit 释放 DMA/缓冲，再重建为当前分辨率）
-bool camera_reconnect() {
-  Dbg.println("摄像头失锁, 正在重连...");
-#ifdef ENABLE_WIFI
-  g_switching = true;
-  wait_tx_idle(200);
-  if (!cam_lock(1500)) {        // 与采集/切换互斥; 拿不到锁则放弃本次重连, 下轮采集自动重试
-    g_switching = false;
-    return false;
-  }
-  esp_camera_deinit();
-  delay(300);
-  g_switching = false;
-  bool ok = init_camera_as(cur_frame, PREVIEW_FRAME);
-  cam_unlock();
-  return ok;
-#else
-  esp_camera_deinit();
-  delay(300);
-  return init_camera_as(cur_frame, PREVIEW_FRAME);
-#endif
-}
-
-// 真正的分辨率切换：deinit + init 全量重配，失败自动回退
-bool camera_change_framesize(framesize_t fs) {
-  if (fs == cur_frame) { return true; }
-  // 快路径: 同为 CIF 系小图(≤QVGA 320x240)、fb_count 均为 2 时, 缓冲区在开机按大图
-  // 已分配、足以容纳两者(含 QCIF/HQVGA 等)。用寄存器级 set_framesize 毫秒切换,
-  // 避开 deinit+init 全量重建造成的 ~0.5-1s 黑屏/冻结。
-  // 必须避开 VGA(触发库 EV-VSYNC-OVF 死循环 bug)与 SVGA/XGA/UXGA(fb_count=1,
-  // 必须重分配缓冲) —— 这些仍走下方慢路径。
-  if (fs <= FRAMESIZE_QVGA && cur_frame <= FRAMESIZE_QVGA
-      && fb_count_for(fs) == 2 && fb_count_for(cur_frame) == 2) {
-    sensor_t *s = esp_camera_sensor_get();
-    if (s && s->set_framesize(s, fs) == 0) {
-      cur_frame = fs;
-      g_config.frame_size = fs;
-      Dbg.printf("预览分辨率快速切换: fs=%d\n", (int)fs);
-      return true;
-    }
-    Dbg.println("快速切换失败 -> 回退全量重建");
-  }
-#ifdef ENABLE_WIFI
-  g_switching = true;
-  wait_tx_idle(500);            // 大分辨率下最后一帧可能近100ms, 留足排空时间
-  if (!cam_lock(1000)) {        // 与核1采集 fb_get/fb_return 双核互斥, 防 deinit 释放后仍被引用
-    Dbg.println("切换取消: 相机锁忙(采集阻塞), 稍后重试");
-    g_switching = false;
-    return false;
-  }
-  esp_camera_deinit();
-  delay(200);
-  bool ok = init_camera_as(fs, cur_frame);
-  cam_unlock();
-  if (!ok) {
-    // 三层重配全失败: 传感器/驱动可能已进入不可恢复状态, 直接复位保证不永久卡死
-    Dbg.println("FSW FAIL -> restart");
-    delay(100);
-    g_switching = false;
-    ESP.restart();
-  }
-  g_switching = false;
-#else
-  esp_camera_deinit();
-  delay(200);
-  bool ok = init_camera_as(fs, cur_frame);
-#endif
-  return ok;
-}
+// init_camera_as / camera_reconnect / camera_change_framesize 已拆到 camera.cpp
+// (wait_tx_idle 保留在本文件: 依赖快照双槽状态, 供 camera 模块经 camera.h 调用)
 
 #ifdef ENABLE_WIFI
 // 抓帧 -> PSRAM 副本写入"最新帧快照"双槽之一，立即归还驱动缓冲。
@@ -904,115 +458,10 @@ void setup() {
 }
 
 #ifdef ENABLE_WIFI
-// Web 配置页：通过设备所在局域网 IP（或上位机 --auto 发现）访问。
-void handle_web_root() {
-  // 预分配缓冲 + 逐段 +=: 原写法一条 ~1.7KB 的 String 链式表达式会在内部反复
-  // realloc/释放, 且全部动态值散落在链中, 在 loopTask 上造成堆碎片。
-  // 现在页面缓冲一次性分配, 每行只产生一个小的临时对象。
-  String html; html.reserve(2200);
-  html += "<!DOCTYPE html><html lang='zh'><meta charset='utf-8'>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>OV2640 摄像头配置</title>"
-    "<style>body{font-family:sans-serif;max-width:520px;margin:40px auto;padding:0 16px}"
-    "input{width:100%;padding:10px;margin:6px 0 14px;box-sizing:border-box;font-size:16px}"
-    "button{width:100%;padding:12px;background:#2f6fed;color:#fff;border:0;font-size:17px;border-radius:6px}"
-    "table{width:100%;border-collapse:collapse}td{padding:6px 0}label{color:#555}</style></head><body>"
-    "<h2>OV2640 摄像头配置</h2><table>";
-  html += "<tr><td>STA 状态</td><td>" + String(WiFi.status() == WL_CONNECTED ? "已连接" : "未连接")
-          + " / " + String(g_sta_ssid) + "</td></tr>";
-  html += "<tr><td>设备ID</td><td>" + String(g_dev_id) + "</td></tr>";
-  html += "<tr><td>中继</td><td>" + String(g_relay_host[0] ? String(g_relay_host) : String("未配置"))
-          + (g_relay_online ? " <b>(在线)</b>" : "") + "</td></tr></table>";
-  html += "<hr><h3>设置摄像头要连接的目标 WiFi</h3><form action='/save' method='get'>";
-  html += "<label>WiFi 名称 (SSID)</label><input name='ssid' value='" + String(g_sta_ssid) + "'>";
-  html += "<label>密码</label><input type='password' name='pass' value='" + String(g_sta_pass) + "'>";
-  html += "<hr><h3>入网标识 / 跨网中继(可选)</h3>";
-  html += "<label>设备ID (局域网发现与中继注册用, 留空自动)</label>"
-          "<input name='id' value='" + String(g_dev_id) + "'>";
-  html += "<label>中继服务端 IP:端口 (如 1.2.3.4:8000, 留空=仅局域网)</label>"
-          "<input name='relay' value='" + String(g_relay_host) + "'>";
-  html += "<label>中继鉴权口令 (与服务器启动参数一致, 留空=不鉴权)</label>"
-          "<input name='token' value='" + String(g_relay_token) + "'>";
-  html += "<button type='submit'>保存并连接</button></form>"
-          "<p style='color:#888'>保存后摄像头将尝试连接该 WiFi。配置页通过目标网络的局域网 IP 访问"
-          "(可在路由器管理页或上位机 --auto 发现)，SoftAP 已彻底关闭。</p></body></html>";
-  httpServer.send(200, "text/html; charset=utf-8", html);
-}
-
-void handle_web_save() {
-  String _ssid = httpServer.hasArg("ssid") ? httpServer.arg("ssid") : "";
-  String _pass = httpServer.hasArg("pass") ? httpServer.arg("pass") : "";
-  String _name = httpServer.hasArg("id")   ? httpServer.arg("id")   : "";
-  String _relay= httpServer.hasArg("relay")? httpServer.arg("relay"): "";
-  String _token= httpServer.hasArg("token")? httpServer.arg("token"): "";
-  _ssid.trim();
-  if (_ssid.isEmpty()) {
-    httpServer.send(200, "text/html; charset=utf-8",
-        "<html><meta charset='utf-8'><body>SSID 不能为空，<a href='/'>返回</a></body></html>");
-    return;
-  }
-  if (_name.isEmpty()) _name = default_dev_id();
-  _relay.trim();
-  _token.trim();
-  g_prefs.begin("wifi", false);
-  g_prefs.putString("ssid", _ssid);
-  g_prefs.putString("pass", _pass);
-  g_prefs.putString("id",   _name);
-  g_prefs.putString("relay", _relay);
-  g_prefs.putString("token", _token);
-  g_prefs.end();
-
-  _ssid.toCharArray(g_sta_ssid, sizeof(g_sta_ssid));
-  _pass.toCharArray(g_sta_pass, sizeof(g_sta_pass));
-  _name.toCharArray(g_dev_id,   sizeof(g_dev_id));
-  if (_name != String(g_dev_name)) _name.toCharArray(g_dev_name, sizeof(g_dev_name));
-  _relay.toCharArray(g_relay_host, sizeof(g_relay_host));
-  _token.toCharArray(g_relay_token, sizeof(g_relay_token));
-
-  httpServer.send(200, "text/html; charset=utf-8",
-      String("<html><meta charset='utf-8'><meta http-equiv='refresh' content='2;url=/'>"
-             "<body>已保存目标 WiFi <b>" + _ssid + "</b>，正在连接，2 秒后刷新…</body></html>"));
-
-  // 立即按新目标重连 STA；成功则摄像头入网。
-  // 凭据写入后关掉兜底热点把射频还给 STA; 若连不上, 兜底热点会保留以便再次配置。
-  if (g_softap_on) {
-    WiFi.softAPdisconnect(true);
-    g_softap_on = false;
-    WiFi.mode(WIFI_STA);
-    Dbg.println("[WiFi] 已写入凭据, 兜底热点关闭");
-  }
-  WiFi.disconnect();
-  delay(50);
-  WiFi.begin(g_sta_ssid, g_sta_pass);
-}
-
-// 默认设备注册 id: cam-<MAC 尾 4 字节>
-String default_dev_id() {
-  uint8_t m[6]; WiFi.macAddress(m);
-  char b[32];
-  snprintf(b, sizeof(b), "cam-%02X%02X%02X%02X", m[2], m[3], m[4], m[5]);
-  return String(b);
-}
+// handle_web_root / handle_web_save / default_dev_id 已拆到 web_cfg.cpp
 
 // 局域网自动发现: 周期 UDP 广播(255.255.255.255:9999)设备名 + STA IP。
 // 上位机 --auto 监听同端口即可自动发现并直连, 无需手动填 IP。
-void disc_announce() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  IPAddress ip = WiFi.localIP();
-  char msg[128];
-  snprintf(msg, sizeof(msg), "OV2640|%s|%d.%d.%d.%d",
-           g_dev_name, ip[0], ip[1], ip[2], ip[3]);
-  disc_udp.beginPacket(IPAddress(255, 255, 255, 255), DISCOVERY_PORT);
-  disc_udp.write((const uint8_t*)msg, strlen(msg));
-  disc_udp.endPacket();
-}
-void disc_task(void *arg) {
-  for (;;) {
-    if (WiFi.status() == WL_CONNECTED) disc_announce();
-    delay(3000);
-  }
-}
-
 // 中继: 发送一条"4字节大端长度+payload"消息; 加锁, 防止与帧上行交错。
 // 三段式 scatter-gather: FRAME头/帧体/FRAME尾 可零拷贝拼成一条消息,
 // 省掉原先"整帧再 malloc 一份 + 两次 memcpy"的开销(每帧一次 PSRAM 分配与整帧拷贝)。
@@ -1445,7 +894,7 @@ bool send_frame_relay(camera_fb_t *fb) {
   if (hn <= 0 || hn >= (int)sizeof(head)) return false;
   return relay_send_iov((const uint8_t*)head, (size_t)hn,
                         fb->buf, fb->len,
-                        (const uint8_t*)FRAME_END, sizeof(FRAME_END) - 1);
+                        (const uint8_t*)FRAME_END, strlen(FRAME_END));
 }
 
 // TURN 兜底发送一帧: 复用 OVU 分片布局, 但每片套上 "C2V" 信封发往服务器 UDP TURN 端口。
@@ -1513,201 +962,8 @@ bool send_frame_udp_via_turn(camera_fb_t *fb) {
   return ok;
 }
 
-void setup_wifi() {
-  WiFi.setSleep(false);
+// setup_wifi / log_wifi_ip / check_sta_link 已拆到 wifi_sta.cpp
 
-  // 从 NVS 读取上次保存的目标 WiFi；没有记录则用编译期默认
-  g_prefs.begin("wifi", true);
-  String _ssid = g_prefs.getString("ssid", String(STA_SSID));
-  String _pass = g_prefs.getString("pass", String(STA_PASS));
-  String _name = g_prefs.getString("name", String(AP_SSID));
-  String _id   = g_prefs.getString("id",   default_dev_id());
-  String _relay= g_prefs.getString("relay", RELAY_HOST_DEFAULT);   // "host:port", 空=关闭中继
-  String _token= g_prefs.getString("token", String(RELAY_TOKEN));  // 中继鉴权口令
-  g_prefs.end();
-  _ssid.toCharArray(g_sta_ssid, sizeof(g_sta_ssid));
-  _pass.toCharArray(g_sta_pass, sizeof(g_sta_pass));
-  _name.toCharArray(g_dev_name, sizeof(g_dev_name));
-  _id.toCharArray(g_dev_id,   sizeof(g_dev_id));
-  _relay.toCharArray(g_relay_host, sizeof(g_relay_host));
-  _token.toCharArray(g_relay_token, sizeof(g_relay_token));
-  if (g_relay_host[0] != 0)
-    Dbg.printf("[中继] 目标: %s (id=%s token=%s)\n", g_relay_host, g_dev_id,
-               g_relay_token[0] ? "已配置" : "无");
-
-  // 凭据加载完再定模式: 无 STA 凭据(NVS 与编译期都没有)时开 SoftAP 兜底,
-  // 保证配网页可达、设备不会变成"连不上也配不了"的死机;
-  // 有凭据则保持纯 STA —— SoftAP 与 STA 时分复用同一射频, 会明显拉低视频吞吐。
-  g_softap_on = (g_sta_ssid[0] == 0);
-  if (g_softap_on) {
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASS);
-    Dbg.printf("[WiFi] 无 STA 凭据, 已开兜底热点 '%s' 供配网(配好后自动关闭)\n", AP_SSID);
-  } else {
-    WiFi.mode(WIFI_STA);   // 纯 STA: 彻底关闭 SoftAP, 释放射频给 STA
-    Dbg.println("[WiFi] 纯 STA 模式, SoftAP 已彻底关闭");
-  }
-
-  cam_server.begin();
-  cam_udp.begin(TCP_PORT);
-  Dbg.printf("[WiFi] TCP监听: %u\n", TCP_PORT);
-
-  // Web 配置页(通过局域网 IP 访问)
-  httpServer.on("/",         HTTP_GET, handle_web_root);
-  httpServer.on("/save",     HTTP_GET, handle_web_save);
-  httpServer.begin();
-  Dbg.println("[WiFi] 配置页已开(局域网 IP:80)");
-
-  if (g_sta_ssid[0] == 0) {
-    Dbg.println("[WiFi] 未配置目标 WiFi, 等待通过配置页写入");
-    return;
-  }
-  Dbg.printf("[WiFi] STA 连接 %s ...\n", g_sta_ssid);
-  WiFi.begin(g_sta_ssid, g_sta_pass);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 12000) {
-    delay(200);
-    Dbg.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    IPAddress ip = WiFi.localIP();
-    Dbg.printf("\n[WiFi] STA已连: %s ip=%d.%d.%d.%d\n",
-               g_sta_ssid, ip[0], ip[1], ip[2], ip[3]);
-    if (g_softap_on) {           // 已入网, 关掉兜底热点把射频还给 STA
-      WiFi.softAPdisconnect(true);
-      g_softap_on = false;
-      Dbg.println("[WiFi] 已入网, 兜底热点关闭");
-    }
-  } else {
-    Dbg.printf("\n[WiFi] STA 连接超时, 设备离线%s\n",
-               g_softap_on ? "(兜底热点已开, 可连入配网)" : "(需重连/重新配置)");
-  }
-}
-
-// 周期打印本机 STA IP（上位机找板子局域网地址用）
-void log_wifi_ip() {
-  if (WiFi.status() == WL_CONNECTED) {
-    uint32_t now = millis();
-    if (now - g_last_ip_log >= 5000) {
-      g_last_ip_log = now;
-      IPAddress ip = WiFi.localIP();
-      Dbg.printf("[WiFi] ip=%d.%d.%d.%d\n", ip[0], ip[1], ip[2], ip[3]);
-    }
-  }
-}
-
-// STA 断线自愈：setup_wifi 只在开机时 connect 一次，掉线后无 AP 兜底，
-// 这里周期性检测并重连（非阻塞，连接结果由后续状态轮询确认）。
-static uint32_t g_sta_last_try = 0;
-void check_sta_link() {
-  uint32_t now = millis();
-  if (WiFi.status() == WL_CONNECTED) { g_sta_last_try = now; return; }
-  if (g_sta_ssid[0] == 0) return;            // 未配置凭据: 由配网页触发连接
-  if (now - g_sta_last_try < 15000) return;
-  g_sta_last_try = now;
-  Dbg.printf("[WiFi] STA 掉线(status=%d), 尝试重连...\n", WiFi.status());
-  WiFi.disconnect();
-  delay(50);
-  WiFi.begin(g_sta_ssid, g_sta_pass);
-}
-
-void log_diag() {
-  uint32_t now = millis();
-  if (g_diag_last_ms == 0 || now - g_diag_last_ms < 5000) return;
-  float dt = (now - g_diag_last_ms) / 1000.0f;
-  float cap_fps = g_diag_cap_frames / dt;
-  float sent_fps = g_diag_sent_frames / dt;
-  float kbps = (g_diag_sent_bytes / 1024.0f) / dt;
-  uint32_t avg_len = (g_diag_sent_frames > 0) ? (uint32_t)(g_diag_sent_bytes / g_diag_sent_frames) : 0;
-  int rssi = WiFi.RSSI();
-  // skp=真丢帧(入队失败/发送失败), evc=队列满主动顶掉的最旧帧(背压, 非故障)
-  Dbg.printf("DIAG cap=%.1f/s sent=%.1f/s kb=%.0f/s avg=%uB uerr=%u rty=%u skp=%u evc=%u bgd=%u nc=%u err=%d q=%d auto=%d rssi=%d\n",
-             cap_fps, sent_fps, kbps, avg_len,
-             g_diag_udp_err, g_diag_udp_retry_ok, g_diag_skip_frames, g_diag_evict_frames,
-             g_diag_bigdrop_frames, g_diag_nc_frames,
-             g_diag_last_err, g_quality, g_auto_quality ? 1 : 0, rssi);
-  g_diag_last_ms = now;
-  g_diag_cap_frames = 0;
-  g_diag_sent_frames = 0;
-  g_diag_skip_frames = 0;
-  g_diag_evict_frames = 0;
-  g_diag_bigdrop_frames = 0;
-  g_diag_nc_frames = 0;
-  g_diag_udp_err = 0;
-  g_diag_udp_retry_ok = 0;
-  g_diag_last_err = 0;
-  g_diag_sent_bytes = 0;
-  g_diag_cap_bytes = 0;
-}
-
-void adapt_quality() {
-  // 原实现仅 udp_mode 时生效, 导致跨网(P2P/TURN/中继)路径下自适应画质完全不工作——
-  // 跨网恰恰最需要动态码率调节。改为检测任意活跃发送通道。
-  bool has_stream = udp_mode || g_p2p_active || g_turn_mode || g_relay_viewer;
-  if (!g_auto_quality || !has_stream) return;
-  // 原来 cur_frame < FRAMESIZE_VGA 直接 return, 导致默认 QVGA 下自适应画质完全不生效,
-  // 与 README 描述不符。改为按分辨率选目标帧率; 下限保留 8(QVGA/CIF 模式下
-  // quality 过低会触发传感器编码卡死无帧, 见 g_quality 初始化注释)。
-  uint32_t now = millis();
-  // 首次调用: 设基线后直接返回, 等下一个采样窗再评估。
-  // 原实现 g_adapt_last_ms==0 时 return 但基线设置在函数末尾(return 之后),
-  // 导致 g_adapt_last_ms 永远为 0, adapt_quality 实际从未生效。
-  if (g_adapt_last_ms == 0) {
-    g_adapt_last_ms    = now;
-    g_adapt_last_sent  = g_adapt_total_frames;
-    g_adapt_last_bytes = g_adapt_total_bytes;
-    g_adapt_last_err   = g_adapt_total_err;
-    g_adapt_last_evict = g_adapt_total_evict;
-    return;
-  }
-  if (now - g_adapt_last_ms < 2500) return;
-
-  float dt = (now - g_adapt_last_ms) / 1000.0f;
-  uint32_t sent_delta = (uint32_t)(g_adapt_total_frames - g_adapt_last_sent);
-  uint64_t bytes_delta = g_adapt_total_bytes - g_adapt_last_bytes;
-  uint32_t err_delta   = g_adapt_total_err - g_adapt_last_err;
-  uint32_t evict_delta = (uint32_t)(g_adapt_total_evict - g_adapt_last_evict);
-  float fps = sent_delta / dt;
-  float kbps = (bytes_delta / 1024.0f) / dt;
-  float target_fps;
-  if (g_turn_mode || g_relay_viewer) {
-    // 跨网路径 RTT 高、带宽受限, 目标帧率低于局域网, 但仍要尽力拉高
-    target_fps = (cur_frame >= FRAMESIZE_VGA) ? 8.0f : 20.0f;
-  } else {
-    target_fps = (cur_frame >= FRAMESIZE_SVGA) ? 8.0f
-                 : (cur_frame >= FRAMESIZE_VGA)  ? 12.0f
-                 : 25.0f;   // QQVGA/QVGA: 传感器上限 30fps
-  }
-
-  int new_q = g_quality;
-  // 拥塞判定: UDP 路径看发送丢包(err_delta); TCP 中继/TURN 路径没有 UDP 丢包,
-  // 拥塞信号是"发送队列被顶"(evict_delta>0) —— 带宽撑不住才会持续顶最旧帧。
-  // 原实现只认 err_delta>0, 纯 TCP 中继下恒为 0, 画质永不下降、帧率被带宽锁死。
-  bool congested = (err_delta > 0) || (evict_delta > 0);
-  // I2: 细化步进 —— 按"距目标帧率的偏差"取步进, 偏差大时大步快速追拢, 接近时
-  // 只微调, 避免低带宽链路下固定 ±2 造成的画质锯齿崩摆。上下限(8/35)、判定带宽
-  // (±2/1.5fps)、忙/闲门槛均保持原值, 只改**逐步长占空比**, 不改变收敛终态。
-  float gap = target_fps - fps;                 // >0 落后于目标
-  int step = (gap > 6.0f) ? 6 : (gap > 3.0f) ? 4 : 2;
-  if (fps < target_fps - 2.0f && congested && g_quality < 35) {
-    new_q = g_quality + step;   // 加大压缩 -> 单帧更小 -> 带宽不变时帧率提升
-  } else if (fps > target_fps + 1.5f && !congested && kbps < 650.0f && g_quality > 8) {
-    new_q = g_quality - 1;   // 有余量才回画质(逐档, 防过冲)
-  }
-
-  if (new_q != g_quality) {
-    g_quality = new_q;
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) s->set_quality(s, g_quality);
-    Dbg.printf("AUTOQ quality=%d fps=%.1f kb=%.0f/s err=%u evc=%u\n",
-               g_quality, fps, kbps, err_delta, evict_delta);
-  }
-  g_adapt_last_ms = now;
-  g_adapt_last_sent = g_adapt_total_frames;
-  g_adapt_last_bytes = g_adapt_total_bytes;
-  g_adapt_last_err = g_adapt_total_err;
-  g_adapt_last_evict = g_adapt_total_evict;
-}
 #endif
 
 // 阻塞等待期间让出 Web 配置页与日志(仅限 loop 任务: WebServer 非线程安全,
