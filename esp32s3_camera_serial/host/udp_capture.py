@@ -61,6 +61,7 @@ G = {
     "frames": 0,             # 完整帧总数(samples 是定长滚动窗, 不能当累计用)
     "drops": 0,              # 按帧序号缺口估算的链路丢帧数
     "photo_pending": False,  # 已发 P 待收照片: 下一个完整 TCP 帧单元路由给照片而非预览
+    "auto_q": True,          # AUTOQ 状态跟踪: 与固件 g_auto_quality 保持一致(默认 ON)
 }
 samples = deque(maxlen=1024)         # (t, bytes) 完整帧滚动记录
 up_samples = deque(maxlen=512)       # 上屏时刻滚动记录(与 samples 同 5s 窗口口径)
@@ -495,13 +496,25 @@ def build_ui(root):
     res_cb.set(res_label("QVGA")); res_cb.pack(side="left", padx=(4, 12))
     ui["res_cb"] = res_cb
 
+    # AUTOQ 与手动互斥的 UI 同步(先定义, 画质栏初始化时立即调用)
+    def _sync_auto_ui():
+        ui["q_scale"].state(["disabled"] if G["auto_q"] else ["!disabled"])
+        ui["q_lbl"].state(["disabled"] if G["auto_q"] else ["!disabled"])
+
     Gs.section_label(tb, "画质:").pack(side="left")
+    # AUTOQ 复选框: 勾选=固件自适应接管(滑杆禁用); 取消=滑杆手动接管, 两者严格互斥
+    auto_var = tk.BooleanVar(value=G["auto_q"])
+    auto_cb = ttk.Checkbutton(tb, text="自动", variable=auto_var,
+                              command=lambda: on_auto_q(auto_var.get()))
+    auto_cb.pack(side="left", padx=(4, 0))
+    ui["auto_var"], ui["auto_cb"] = auto_var, auto_cb
     q_var = tk.IntVar(value=10)
     q_scale = ttk.Scale(tb, from_=8, to=40, variable=q_var, length=110)
     q_scale.pack(side="left", padx=(4, 2))
     q_lbl = ttk.Label(tb, text=str(q_var.get()), width=3)
     q_lbl.pack(side="left", padx=(0, 12))
-    ui["q_var"], ui["q_lbl"] = q_var, q_lbl
+    ui["q_var"], ui["q_lbl"], ui["q_scale"] = q_var, q_lbl, q_scale
+    _sync_auto_ui()
 
     Gs.section_label(tb, "拍照:").pack(side="left")
     photo_cb = ttk.Combobox(tb, values=RES_LABELS, state="readonly", width=14)
@@ -559,6 +572,15 @@ def build_ui(root):
         if send_cmd(bytes([v])):
             print(f"quality -> {v}", flush=True)
     q_scale.bind("<ButtonRelease-1>", on_q_release)
+
+    # AUTOQ 与手动互斥: 勾选=自动接管(禁用滑杆), 取消=手动接管。
+    # 固件 'a' 是 toggle: 借助 G["auto_q"] 状态跟踪, 仅在真正需要翻转时才发一次,
+    # 保证本地复选框与固件 g_auto_quality 保持同步, 不会因重发/toggle 漂移。
+    def on_auto_q(want_on):
+        if want_on != G["auto_q"] and send_cmd(b"a"):
+            G["auto_q"] = want_on
+            print(f"AUTOQ -> {'ON' if want_on else 'OFF'}", flush=True)
+        _sync_auto_ui()
 
     root.bind("<Control-q>", lambda e: close())
     root.bind("<Control-s>", lambda e: snapshot())

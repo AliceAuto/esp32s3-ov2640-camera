@@ -15,24 +15,24 @@ live_capture / udp_capture 两个 Tkinter 上位机共用同一套现代化深�
 import tkinter as tk
 from tkinter import ttk
 
-# ---- 配色 ----
-BG        = "#1b1d22"   # 窗口背景
-PANEL     = "#23262c"   # 工具栏/状态栏背景
-PANEL2    = "#2b2f37"   # 控件/内嵌面板背景
-FIELD     = "#31363f"   # 下拉/输入框背景
-FG        = "#e9ecf2"   # 主文字
-FG_DIM    = "#aab0bd"   # 次要文字
-FG_HINT   = "#767d8a"   # 提示文字
-BORDER    = "#3b4049"   # 边框
-ACCENT    = "#3fa9f5"   # 主强调色(蓝)
-ACCENT_DK = "#1f7fd6"   # 强调深(按下/悬停)
-OK        = "#2fbf71"   # 实时(绿)
-WARN      = "#e09a3e"   # 等帧(橙)
-DANGER    = "#e5534d"   # 未连(红)
-PHOTO     = "#26d1a1"   # 拍照按钮(青绿)
-PHOTO_DK  = "#1aa684"
-VIDEO_BG  = "#0c0d10"   # 视频区
-SELECT    = "#3d6ea5"   # 下拉选中项
+# ---- 配色(现代暗色, 参考 Nord/One Dark 系, 高对比且克制) ----
+BG        = "#14161c"   # 窗口背景(近黑蓝)
+PANEL     = "#1c1f27"   # 工具栏/状态栏背景
+PANEL2    = "#262a34"   # 控件/内嵌面板背景
+FIELD     = "#2f3442"   # 下拉/输入框背景
+FG        = "#eceff5"   # 主文字
+FG_DIM    = "#9aa3b5"   # 次要文字
+FG_HINT   = "#6b7284"   # 提示文字
+BORDER    = "#343a47"   # 边框
+ACCENT    = "#4f8cff"   # 主强调色(亮蓝)
+ACCENT_DK = "#2f6fe0"   # 强调深(按下/悬停)
+OK        = "#34d399"   # 实时(绿)
+WARN      = "#f5b04f"   # 等帧(橙)
+DANGER    = "#ef5b60"   # 未连(红)
+PHOTO     = "#22d3a7"   # 拍照按钮(青绿)
+PHOTO_DK  = "#17a085"
+VIDEO_BG  = "#0a0b0e"   # 视频区
+SELECT    = "#3d6fb5"   # 下拉选中项
 
 FONT = "Microsoft YaHei UI"
 
@@ -116,10 +116,15 @@ def apply_theme(root):
     style.configure("TEntry", background=FIELD, foreground=FG, fieldbackground=FIELD)
     style.configure("TSpinbox", background=FIELD, foreground=FG, fieldbackground=FIELD)
 
-    # 滑杆
-    style.configure("TScale", background=BG, troughcolor=PANEL2, bordercolor=BORDER)
-    style.configure("Vertical.TScale", background=BG, troughcolor=PANEL2,
-                    bordercolor=BORDER)
+    # 滑杆: 轨道提亮到 FIELD, 滑块用强调蓝, 在深色工具栏上清晰可见。
+    # 注: clam 的 TScale thumb 与轨道都用 style 的 background/troughcolor 上色;
+    # 布局方向(横/纵)由 Horizontal./Vertical. 前缀区分。
+    for _name in ("TScale", "Horizontal.TScale", "Vertical.TScale"):
+        style.configure(_name, background=ACCENT, troughcolor=FIELD,
+                        bordercolor=BORDER, sliderlength=18, sliderrelief="flat",
+                        sliderthickness=10)
+        style.map(_name, background=[("active", ACCENT_DK)],
+                  troughcolor=[("disabled", PANEL2)])
 
     # 下拉列表深色(ttk.Combobox 的弹出 listbox)
     try:
@@ -134,9 +139,9 @@ def apply_theme(root):
 
 
 def badge(parent, text=" 连接中 ", bg=WARN):
-    """状态徽章 Label: 圆角胶囊观感(padding 撑出), 后续可 config(text=, bg=) 变色。"""
-    return tk.Label(parent, text=text, fg="#ffffff", bg=bg,
-                    padx=8, pady=2, font=font(9, True))
+    """状态徽章 Label: 胶囊观感(大内边距+粗体+深色字提升彩底对比), 可 config 变色。"""
+    return tk.Label(parent, text=text, fg="#0b0d10", bg=bg,
+                    padx=10, pady=3, font=font(9, True))
 
 
 def option_menu(parent, variable, values, command=None, width=None):
@@ -165,3 +170,29 @@ def video_canvas(parent, width=640, height=480, bg=VIDEO_BG):
 def section_label(parent, text):
     """工具栏分组标签(次要文字色, 视觉上弱于控件)。"""
     return ttk.Label(parent, text=text, foreground=FG_DIM)
+
+
+def hdivider(parent, color=BORDER):
+    """水平分隔线(1px): 区分工具栏/视频区/状态栏等区块。"""
+    return tk.Frame(parent, bg=color, height=1, bd=0, highlightthickness=0)
+
+
+def vdivider(parent, color=BORDER, padx=8):
+    """工具栏内的竖向细分隔(分组之间的视觉边界)。"""
+    f = tk.Frame(parent, bg=color, width=1)
+    f.pack(side="left", fill="y", padx=padx, pady=2)
+    return f
+
+
+def big_value(parent, text="--", color=FG, size=16, bg=PANEL):
+    """大号数值标签(fps 等关键指标, 粗体+亮色, 一目了然)。"""
+    return tk.Label(parent, text=text, fg=color, bg=bg, font=font(size, True))
+
+
+def brand(parent, title, sub=""):
+    """品牌/标题区: 应用名(强调蓝) + 副标题(连接目标, 次要色)。"""
+    f = tk.Frame(parent, bg=BG)
+    tk.Label(f, text=title, fg=ACCENT, bg=BG, font=font(12, True)).pack(side="left")
+    if sub:
+        tk.Label(f, text=sub, fg=FG_HINT, bg=BG, font=font(10)).pack(side="left", padx=(8, 0))
+    return f
