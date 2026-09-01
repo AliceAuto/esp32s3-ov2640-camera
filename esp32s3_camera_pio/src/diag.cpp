@@ -185,6 +185,7 @@ void send_diag_beat() {
       g_diag_last_err, g_quality, g_auto_quality ? 1 : 0, rssi,
       udp_mode ? 1 : 0, (unsigned)ESP.getFreeHeap());
   if (n < 0 || n >= (int)sizeof(buf)) return;
+  log_i("DIAG %s", buf);   // esp_log 控制台(COM10)无条件可见, 便于定位心跳/采集状态
   // 双通道上报: UDP 专属诊断口(发往客户端 IP) + cam_client 的 TCP 通道。
   // TCP 通道一定能到达(除非 TCP 接收方不读会被写缓冲, 但诊断稀疏不阻塞预览)。
   if (snap && snap.connected()) {

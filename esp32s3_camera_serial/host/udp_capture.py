@@ -8,10 +8,12 @@ OV2640 UDP 高帧率预览上位机 v2。
   预览分辨率、JPEG画质滑杆、照片分辨率+拍照(防连点)、当前画面存图。
 
 用法: python udp_capture.py --wifi [host] [port] [res_code]
+      python udp_capture.py --relay 中继服务器:端口 [--id 设备ID]   # 纯跨网中继
+      python udp_capture.py --lanrelay [--id 设备ID]              # 局域网优先, 失败自动回退中继
       python udp_capture.py --selftest          # 无 GUI 协议自检
 快捷键: Ctrl+Q 退出, Ctrl+S 当前画面存图
 """
-import sys, os, io, re, time, threading, queue
+import sys, os, io, re, time, threading, queue, json
 import socket
 from collections import deque
 
@@ -21,11 +23,35 @@ except ImportError:
     np = None
 
 # ---- 参数解析 (兼容旧用法: --wifi [host] [port] [res]) ----
-_args = [x for x in sys.argv[1:] if x != "--wifi"]
+_FLAGS = ("--wifi", "--relay", "--lanrelay", "--id", "--token")
+def _fv(name):
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
 SELFTEST = "--selftest" in sys.argv
-host = _args[0] if _args else "192.168.4.1"
-port = int(_args[1]) if len(_args) > 1 else 3333
-res_code = (_args[2].strip() if len(_args) > 2 else "")
+# 传输模式: relay=强制中继; lanrelay=局域网优先, 失败回退中继; lan=仅局域网(UDP/TCP)
+if "--relay" in sys.argv:
+    TRANSPORT = "relay"
+elif "--lanrelay" in sys.argv:
+    TRANSPORT = "lanrelay"
+else:
+    TRANSPORT = "lan"
+# 中继服务端 "host:port", 仅在 relay/lanrelay 用
+_RELAY_SPEC = _fv("--relay") or "8.148.79.85:8001"
+_ID = _fv("--id")
+# 纯位置参数(去掉所有 --flag 及其取值)
+_skip = _FLAGS + tuple(v for v in (_ID,) if v)
+ARGV = [x for x in sys.argv[1:] if x not in _skip]
+if TRANSPORT == "lan":
+    host = ARGV[0] if ARGV else "192.168.4.1"
+    port = int(ARGV[1]) if len(ARGV) > 1 else 3333
+    res_code = (ARGV[2].strip() if len(ARGV) > 2 else "")
+else:
+    host = "192.168.4.1"     # 中继模式不使用局域网直连地址
+    port = 3333
+    res_code = ""
 
 # ---- 协议常量(与固件 send_frame_udp 一致) ----
 HDR = 12
@@ -55,6 +81,7 @@ STAT_WINDOW = 5.0            # 帧率统计窗口(秒)
 G = {
     "mode": "UDP",
     "tcp": None,
+    "relay": None,
     "stop": threading.Event(),
     "last_good": 0.0,        # 最近一次完整预览帧到达时刻
     "photo_until": 0.0,      # 拍照互斥截止时刻
@@ -73,6 +100,9 @@ photo_q = queue.Queue()
 udp_ctx = {"seq": None, "cnt": 0, "w": 0, "h": 0, "fmt": 0,
            "parts": None, "got": 0}
 _TCP_FRAME = re.compile(rb'FRAME_BEGIN\nSIZE (\d+) (\d+) (\w+)\n(.*?)FRAME_END\n', re.S)
+# 合并通道(relay/lanrelay)实际落地通道: True=走了中继兜底, False=局域网直连
+_relay_on = [TRANSPORT == "relay"]
+DISCOVERY_PORT = 9999
 
 
 def _put_latest(item):
@@ -236,8 +266,19 @@ def mode_cmd(code=None):
 
 
 def send_cmd(data):
-    c = G["tcp"]
     payload = data.encode() if isinstance(data, str) else data
+    if _relay_on[0]:
+        c = G["relay"]
+        if c is None:
+            print("发送失败: 无中继命令通道", flush=True)
+            return False
+        try:
+            c.write(payload)
+            return True
+        except OSError as e:
+            print("发送失败:", e, flush=True)
+            return False
+    c = G["tcp"]
     if c is None:
         print("发送失败: 无命令通道", flush=True)
         return False
@@ -247,6 +288,171 @@ def send_cmd(data):
     except OSError as e:
         print("发送失败:", e, flush=True)
         return False
+
+
+def discover_cameras(timeout=4.0):
+    """监听 UDP 9999 广播，收集 {ip: 设备名}。摄像头入网后每 3s 广播一次。"""
+    found = {}
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except Exception:
+        pass
+    s.bind(("0.0.0.0", DISCOVERY_PORT))
+    s.settimeout(0.5)
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            data, _ = s.recvfrom(512)
+        except socket.timeout:
+            continue
+        except Exception:
+            break
+        txt = data.decode(errors="ignore")
+        if txt.startswith("OV2640|"):
+            p = txt.split("|")
+            if len(p) >= 3:
+                found[p[2]] = p[1]
+    s.close()
+    return found
+
+
+class RelayIo:
+    """把中继服务端的"4B大端长度+payload"消息流解包成浏览器可读的数据流。
+
+    观众端: 连中继 -> list -> watch(建立观看) -> 持续读取摄像头帧消息。
+    read(n) 返回与 serial 同名的字节流(已滤掉 JSON 信令), 供 _pump_bytes 解析;
+    write(b) 把命令打包成一条中继消息下发。"""
+    def __init__(self, host, port, dev_id):
+        self.s = socket.create_connection((host, port), timeout=8)
+        self._rbuf = b""           # 原始 socket 字节(含长度前缀)
+        self.buf = b""             # 解包后待消费的 payload 字节(供 read)
+        self._buf_lock = threading.Lock()
+        self.cam_id = None
+        devs = self._handshake(dev_id)
+        self.cam_id = devs["id"]
+        print(f"经中继观看: {devs['id']} (via {host}:{port})", flush=True)
+
+    def _send_json(self, o):
+        b = json.dumps(o).encode()
+        self.s.sendall(len(b).to_bytes(4, "big") + b)
+
+    def _recv_exact(self, n):
+        data = b""
+        while len(data) < n:
+            d = self.s.recv(n - len(data))
+            if not d:
+                raise OSError("中继连接关闭")
+            data += d
+        return data
+
+    def _handshake(self, dev_id):
+        self._send_json({"t": "list"})
+        devs = json.loads(self._recv_exact(int.from_bytes(self._recv_exact(4), "big")))
+        devs = devs.get("devices", [])
+        if not devs:
+            raise RuntimeError("中继上无在线摄像头")
+        if dev_id:
+            target = next((d for d in devs if d["id"] == dev_id or d["name"] == dev_id), None)
+            if not target:
+                raise RuntimeError(f"中继无设备 {dev_id}; 可用: {[d['id'] for d in devs]}")
+        else:
+            target = devs[0]
+            print(f"中继在线: {[(d['id'], d.get('name')) for d in devs]}", flush=True)
+            print(f"未指定 --id, 自动选择第一个: {target['id']}", flush=True)
+        self._send_json({"t": "watch", "id": target["id"]})
+        r = json.loads(self._recv_exact(int.from_bytes(self._recv_exact(4), "big")))
+        if r.get("t") != "watch_ok":
+            msg = r.get("msg", "")
+            if msg == "unauthorized":
+                raise RuntimeError("鉴权失败: 服务器要求 token, 请用 --token <口令> 指定")
+            raise RuntimeError("观看请求失败: " + msg)
+        return target
+
+    def _read_one(self):
+        """读一条完整消息; 无数据(超时)返回 None; 断连返回 b''。"""
+        while len(self._rbuf) < 4:
+            try:
+                d = self.s.recv(4 - len(self._rbuf))
+            except socket.timeout:
+                return None
+            except OSError:
+                return b""
+            if not d:
+                return b""
+            self._rbuf += d
+        n = int.from_bytes(self._rbuf[:4], "big")
+        self._rbuf = self._rbuf[4:]
+        while len(self._rbuf) < n:
+            try:
+                d = self.s.recv(n - len(self._rbuf))
+            except socket.timeout:
+                return None
+            except OSError:
+                return b""
+            if not d:
+                return b""
+            self._rbuf += d
+        out, self._rbuf = self._rbuf[:n], self._rbuf[n:]
+        return out
+
+    def read(self, n):
+        """返回至多 n 字节已解包数据(跳过服务端 JSON 信令); 无数据返回 b''。"""
+        while True:
+            with self._buf_lock:
+                have = len(self.buf)
+            if have:
+                break
+            msg = self._read_one()
+            if msg is None or msg == b"":
+                break
+            if msg[:1] == b"{":
+                continue          # 服务端信令, 跳过
+            with self._buf_lock:
+                self.buf += msg
+                if self.buf:
+                    break
+        with self._buf_lock:
+            out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def write(self, b):
+        if isinstance(b, str):
+            b = b.encode()
+        if not b:
+            return 0
+        self.s.sendall(len(b).to_bytes(4, "big") + b)
+        return len(b)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+
+
+def _relay_spec(portn):
+    """拆中继服务端 "host:port" -> (host, port)。"""
+    host, _, p = _RELAY_SPEC.rpartition(":")
+    return (host or "127.0.0.1", int(p or portn or 8001))
+
+
+def open_relay(stop_ev):
+    """连接中继服务端并完成 watch 握手, 返回流式 RelayIo。失败逐次重试。"""
+    for _ in range(60):
+        if stop_ev.is_set():
+            return None
+        try:
+            host, p = _relay_spec(_RELAY_SPEC)
+            return RelayIo(host, p, _ID)
+        except Exception as e:
+            print("中继连接失败:", e, flush=True)
+            time.sleep(1.0)
+    return None
 
 
 def open_tcp_cmd(stop_ev):
@@ -268,6 +474,50 @@ def open_tcp_cmd(stop_ev):
     return None
 
 
+def _open_lan_tcp(ip_, stop_ev):
+    """局域网直连预览: 打开摄像头 TCP 3333 命令/流通道(与中继同为 FRAME_BEGIN 帧,
+    _pump_bytes 解析)。打开后立即一次性对齐板子: 'N' 让板子走 TCP 推流(而非被别的
+    客户端设成 UDP 模式), 并带默认预览分辨率, 避免收到的帧尺寸与 GUI 不符被丢弃。"""
+    cmd = ("V" + (res_code or "t") + "N").encode()
+    for _ in range(10):
+        if stop_ev.is_set():
+            return None
+        try:
+            c = socket.create_connection((ip_, 3333), timeout=4)
+            c.settimeout(0.05)
+            c.sendall(cmd)
+            print(f"局域网直连已连 {ip_:}:3333, 已发 {cmd!r}", flush=True)
+            return c
+        except OSError:
+            time.sleep(1.0)
+    return None
+
+
+def _lan_session(sock, stop_ev):
+    """局域网直连 TCP 收流会话(FRAME_BEGIN 帧)。断流超时即返回, 由上层回退中继。"""
+    G["tcp"] = sock
+    sock.settimeout(0)
+    _clear_rxbuffers()
+    last_good = time.time()
+    while not stop_ev.is_set():
+        now = time.time()
+        if (now - max(last_good, G["last_good"]) > RECONNECT_AFTER
+                and now >= G["photo_until"]):
+            print("[lan] 局域网直连停流超时, 结束本会话", flush=True)
+            break
+        pump_tcp(sock)
+        if time.time() - stat_t[0] >= 3.0:
+            _stat_report()
+            stat_t[0] = time.time()
+        time.sleep(0.002)
+    try:
+        sock.close()
+    except Exception:
+        pass
+    G["tcp"] = None
+    _relay_on[0] = True      # 局域网会话结束, 后续命令/重连走中继
+
+
 def window_stats(win=STAT_WINDOW):
     """最近 win 秒内的 (帧数, 字节数)。"""
     t0 = time.time() - win
@@ -279,8 +529,73 @@ def window_stats(win=STAT_WINDOW):
     return n, byt
 
 
+def _stat_report():
+    """每 ~3s 打一次收流统计(清屏用, 不依赖 GUI)。"""
+    n, byt = window_stats()
+    fps = n / STAT_WINDOW
+    print(f"[stats] {n}帧/{STAT_WINDOW:.0f}s  {fps:.1f}fps  {byt / 1024:.0f}KB/s  "
+          f"帧计{G['frames']} 丢帧{G['drops']}", flush=True)
+
+
 def _reader_body(stop_ev):
-    """单次收流会话；异常交给外层 supervisor 捕获重启。"""
+    """单次收流会话；异常交给外层 supervisor 捕获重启。
+
+    lanrelay(合并通道): 先局域网发现+直连(UDP/TCP), 不通自动回退中继兜底。
+    relay: 直接走中继。"""
+    if TRANSPORT in ("relay", "lanrelay"):
+        # 中继通道: 统一走 RelayIo(收流 + 命令同一条连接), 不建 UDP / 局域网直连。
+        if TRANSPORT == "lanrelay" and not _relay_on[0]:
+            cam = discover_cameras()
+            if cam:
+                h = list(cam.keys())[0]
+                print(f"发现 {len(cam)} 台: {cam}", flush=True)
+                ip_ = h
+                tok = _open_lan_tcp(ip_, stop_ev)
+                if tok is not None:
+                    _relay_on[0] = False      # 局域网直连成功, 不走中继
+                    _lan_session(tok, stop_ev)   # 会话结束(断流)后回退中继兜底
+                    print("局域网会话结束, 回退中继兜底", flush=True)
+                else:
+                    print("局域网直连失败, 自动回退中继兜底", flush=True)
+            else:
+                print("局域网未发现摄像头, 自动回退中继兜底", flush=True)
+        _relay_on[0] = True
+        _clear_rxbuffers()
+        relay = open_relay(stop_ev)
+        if relay is None:
+            return
+        G["relay"] = relay
+        last_good = time.time()
+        while not stop_ev.is_set():
+            now = time.time()
+            if now - max(last_good, G["last_good"]) > RECONNECT_AFTER and now >= G["photo_until"]:
+                print("[relay] 停流超时, 重连中继...", flush=True)
+                G["relay"] = None
+                try:
+                    relay.close()
+                except Exception:
+                    pass
+                relay = open_relay(stop_ev)
+                if relay is None:
+                    break
+                G["relay"] = relay
+                _clear_rxbuffers()
+                last_good = time.time()
+            data = relay.read(65536)
+            if data:
+                _pump_bytes(data)
+            if time.time() - stat_t[0] >= 3.0:
+                _stat_report()
+                stat_t[0] = time.time()
+            time.sleep(0.002)
+        try:
+            relay.close()
+        except Exception:
+            pass
+        G["relay"] = None
+        return
+
+    # ---- 局域网直连(UDP 预览 + TCP 命令) ----
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -301,10 +616,6 @@ def _reader_body(stop_ev):
 
     while not stop_ev.is_set():
         now = time.time()
-        # 停流超时判定在拍照窗口内让路: P 命令期间预览必然暂停数秒,
-        # 此时重连会把正在回传的照片流切断。
-        # 注意不依赖 G["tcp"] 非空: 连接被对端硬拆时它已被置 None,
-        # 以往这里会永远跳过重连且不打日志(静默假死)。
         if (now - max(last_good, G["last_good"]) > RECONNECT_AFTER
                 and now >= G["photo_until"]):
             print(f"[{G['mode']}] 停流超时, 重连重下发...", flush=True)
@@ -356,15 +667,7 @@ def _reader_body(stop_ev):
                 last_good = time.time()
 
         if time.time() - stat_t[0] >= 3.0:
-            n, byt = window_stats()
-            now = time.time()
-            # 上屏 fps(同 5s 窗口): 与"链路 fps"并列, 一眼分辨瓶颈在传输还是显示端
-            while up_samples and up_samples[0] < now - STAT_WINDOW:
-                up_samples.popleft()
-            fps_up = len(up_samples) / STAT_WINDOW
-            print(f"{G['mode']:>3} 链路={n / STAT_WINDOW:6.1f} 上屏={fps_up:6.1f} fps "
-                  f"kb={(byt / 1024) / STAT_WINDOW:5.0f}/s "
-                  f"累计 {G['frames']} 丢帧 {G['drops']}", flush=True)
+            _stat_report()
             stat_t[0] = time.time()
 
     try:

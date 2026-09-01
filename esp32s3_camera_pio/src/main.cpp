@@ -442,9 +442,11 @@ void setup() {
   Dbg.println("摄像头初始化成功 (JPEG)");
   g_cam_ready = true;
   apply_color_calib();
+  log_i("CAM init ok");
 
 #ifdef ENABLE_WIFI
   setup_wifi();
+  log_i("CAM setup_wifi returned");
   g_snap_mutex = xSemaphoreCreateMutex();
   g_new_frame  = xSemaphoreCreateCounting(SNAP_SLOTS * 4, 0);   // 新帧发布信号量
   memset(g_snap, 0, sizeof(g_snap));
@@ -469,6 +471,7 @@ void setup() {
   xTaskCreatePinnedToCore(diag_beat_task, "diagb", 3072, NULL, 1, NULL, 0); // UDP 诊断心跳(核0)
   g_diag_last_ms = millis();
   g_adapt_last_ms = millis();
+  log_i("CAM setup done, tasks up");
 #endif
 }
 
@@ -1156,6 +1159,7 @@ void loop() {
         cam_client.setTimeout(500);
         xSemaphoreGive(g_cli_mutex);
         Dbg.println("WiFi 客户端接入(抢占)");
+        log_i("NET accept(抢占) cam_ready=%d", (int)g_cam_ready);
       } else {
         // 抢锁失败: sender_task 每帧都持该锁发送, 撞上发送窗口很常见。
         // 原实现让 s 在此析构 -> 关闭新连接, 上位机"已连但无流"(实测 0 fps)。
@@ -1174,6 +1178,7 @@ void loop() {
         cam_client.setTimeout(500);
         xSemaphoreGive(g_cli_mutex);
         Dbg.println("WiFi 客户端接入(延迟接管)");
+        log_i("NET accept(延迟) cam_ready=%d", (int)g_cam_ready);
       }
     }
     check_sta_link();

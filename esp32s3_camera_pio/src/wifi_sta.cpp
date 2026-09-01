@@ -9,6 +9,7 @@ static uint32_t g_sta_last_try = 0;
 
 void setup_wifi() {
   WiFi.setSleep(false);
+  log_i("WF entry");
 
   // 从 NVS 读取上次保存的目标 WiFi；没有记录则用编译期默认
   g_prefs.begin("wifi", true);
@@ -19,6 +20,7 @@ void setup_wifi() {
   String _relay= g_prefs.getString("relay", RELAY_HOST_DEFAULT);   // "host:port", 空=关闭中继
   String _token= g_prefs.getString("token", String(RELAY_TOKEN));  // 中继鉴权口令
   g_prefs.end();
+  log_i("WF after nvs");
   _ssid.toCharArray(g_sta_ssid, sizeof(g_sta_ssid));
   _pass.toCharArray(g_sta_pass, sizeof(g_sta_pass));
   _name.toCharArray(g_dev_name, sizeof(g_dev_name));
@@ -45,6 +47,7 @@ void setup_wifi() {
   cam_server.begin();
   cam_udp.begin(TCP_PORT);
   Dbg.printf("[WiFi] TCP监听: %u\n", TCP_PORT);
+  log_i("WF server/udp bound");
 
   // Web 配置页(通过局域网 IP 访问)
   httpServer.on("/",         HTTP_GET, handle_web_root);
@@ -57,12 +60,14 @@ void setup_wifi() {
     return;
   }
   Dbg.printf("[WiFi] STA 连接 %s ...\n", g_sta_ssid);
+  log_i("WF begin %s", g_sta_ssid);
   WiFi.begin(g_sta_ssid, g_sta_pass);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 12000) {
     delay(200);
     Dbg.print(".");
   }
+  log_i("WF after-connect status=%d", (int)WiFi.status());
   if (WiFi.status() == WL_CONNECTED) {
     IPAddress ip = WiFi.localIP();
     Dbg.printf("\n[WiFi] STA已连: %s ip=%d.%d.%d.%d\n",
