@@ -27,7 +27,7 @@
                                    relay_server.py (云)
                                               │
                                               ▼
-                                   host/udp_capture.py (终端，含单独诊断脚本)
+                                   host/udp_capture.py (终端)
 ```
 
 ---
@@ -38,7 +38,6 @@
   - `platformio.ini` — 编译配置；`src/main.cpp` — 固件主体
 - `esp32s3_camera_serial/host/` — **Python 上位机工具集**
   - `udp_capture.py` — 主预览程序（串口 / WiFi / UDP / 中继均可）
-  - `diagnostics/` — 位级/色彩/结构诊断脚本（曾定位花屏=坏数据线）
   - `archive/` — 旧 Arduino `.ino` 固件与历史维护文档（归档存证）
 - `relay_server.py` — **跨网信令 + 中继服务端**（云服务器运行）
 - `deploy/` — 中继服务部署与量化测试工具（`relay_fps.py`、`test_switch.py` 等）
