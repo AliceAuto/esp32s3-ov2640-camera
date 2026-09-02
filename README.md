@@ -23,7 +23,7 @@ ov2640/
 ├── esp32s3_camera_pio/          # 当前固件（PlatformIO，源码编译 esp32-camera，解锁 JPEG）
 │   └── src/main.cpp             # 固件主体
 ├── esp32s3_camera_serial/host/  # Python 上位机工具集
-│   ├── live_capture.py          # 主预览程序（串口/WiFi/中继）
+│   ├── udp_capture.py           # 主预览程序（串口/WiFi/UDP/中继）
 │   └── diagnostics/             # 开发期诊断脚本（归档索引）
 ├── relay_server.py              # 跨网信令 + 中继服务端（云服务器）
 ├── deploy/                      # 部署与量化测试工具（relay_fps.py、test_switch.py 等）
@@ -51,17 +51,16 @@ pio run -t upload       # 烧录（platformio.ini: upload_port = COM10）
 cd esp32s3_camera_serial/host
 
 # 跨网中继观看（推荐，需云中继在线）
-python live_capture.py --relay 8.148.79.85:8001 --id cam-1DCD23D8
+python udp_capture.py --relay 8.148.79.85:8001 --id cam-1DCD23D8
 
 # 局域网 WiFi（TCP 可靠 / UDP 高帧率）
-python live_capture.py --wifi 192.168.10.118 3333
-python udp_capture.py   --wifi 192.168.10.118 3333
+python udp_capture.py --wifi 192.168.10.118 3333
 
-# 局域网自动发现
-python live_capture.py --auto
+# 局域网优先，失败自动回退中继
+python udp_capture.py --lanrelay
 
 # 串口（2Mbaud 基线）
-python live_capture.py COM10
+python udp_capture.py COM10
 ```
 
 ### 中继服务端（云服务器）

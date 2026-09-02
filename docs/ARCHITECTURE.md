@@ -12,7 +12,7 @@
 - **采集**：OV2640 DVP 接口，硬件 JPEG 编码，PSRAM 帧缓冲，RGB565 可由编译开关切换。
 - **主控**：ESP32-S3（双核 240MHz，8MB OPI PSRAM），FreeRTOS（Arduino 框架）。
 - **传输**：四类通道并存 —— 串口 UART0 2Mbaud、局域网 WiFi TCP、局域网 WiFi UDP（高帧率）、公网中继（跨网，含 P2P/TURN）。
-- **上位机**：Python3 + tkinter + Pillow，`live_capture.py` 实时预览/分辨率切换/一键拍照。
+- **上位机**：Python3 + tkinter + Pillow，`udp_capture.py` 实时预览/分辨率切换/一键拍照。
 
 ```
                     ┌────────────────────────────────────────────┐
@@ -27,7 +27,7 @@
                                    relay_server.py (云)
                                               │
                                               ▼
-                                   host/live_capture.py (终端，含单独诊断脚本)
+                                   host/udp_capture.py (终端，含单独诊断脚本)
 ```
 
 ---
@@ -37,7 +37,7 @@
 - `esp32s3_camera_pio/` — **当前固件**（PlatformIO，从源码编译 esp32-camera，解锁 JPEG）
   - `platformio.ini` — 编译配置；`src/main.cpp` — 固件主体
 - `esp32s3_camera_serial/host/` — **Python 上位机工具集**
-  - `live_capture.py` — 主预览程序（串口 / WiFi / 中继均可）
+  - `udp_capture.py` — 主预览程序（串口 / WiFi / UDP / 中继均可）
   - `diagnostics/` — 位级/色彩/结构诊断脚本（曾定位花屏=坏数据线）
   - `archive/` — 旧 Arduino `.ino` 固件与历史维护文档（归档存证）
 - `relay_server.py` — **跨网信令 + 中继服务端**（云服务器运行）
@@ -139,7 +139,7 @@ FRAME_END\n
 
 ---
 
-## 5. 上位机架构（`host/live_capture.py`）
+## 5. 上位机架构（`host/udp_capture.py`）
 
 - **传输通道抽象**：位置参数 + 开关选择串口 / `--wifi` / `--auto` / `--relay`，共用同一 `FRAME/SIZE/END` 帧解析。
 - **最新帧优先队列**：`queue.Queue(maxsize=2)` + `put_latest()`，满则丢最旧，渲染永不滞后。

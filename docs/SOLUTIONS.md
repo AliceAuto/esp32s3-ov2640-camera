@@ -67,7 +67,7 @@
 ### N2. 多客户端"抢占式"接管导致互相顶帧
 - **现象**：多个预览进程同时连接同一摄像头 → 画面卡顿、帧率忽高忽低、新连接顶掉旧连接。
 - **机制**：固件 loop() 对 TCP 采用**抢占式 accept** —— 即使旧客户端仍 `connected()`，新连接也接管并 `stop()` 旧的。
-- **规避**：一台摄像头同一时刻只用一个观看进程（尤其别同时跑多个 `live_capture.py`/`relay_fps.py`）。排查用 `Get-CimInstance Win32_Process` 按命令行匹配清理。
+- **规避**：一台摄像头同一时刻只用一个观看进程（尤其别同时跑多个 `udp_capture.py`/`relay_fps.py`）。排查用 `Get-CimInstance Win32_Process` 按命令行匹配清理。
 
 ### N3. WiFi TX 队列满（ERR_MEM）→ 分帧大小差异化重试
 - **现象**：DIAG `err=-1`（lwIP ERR_MEM = netif TX 队列满），QQVGA 丢片 2%、VGA 掉到 5fps；1ms×3 短重试几乎不恢复。
@@ -105,7 +105,7 @@
 - 预览队列 `maxsize=2` + `put_latest()`（满丢最旧）保证渲染永不滞后；滑动窗口每秒结算帧率，界面底部实时显示 —— 帧率数字与实际观感一致。
 
 ### P4. 串口占用 PermissionError(13)
-- 多个残留 python 进程占用 COM 口。用 `Get-CimInstance Win32_Process` 按 `CommandLine` 匹配 `live_capture` 并 `Stop-Process` 结束。
+- 多个残留 python 进程占用 COM 口。用 `Get-CimInstance Win32_Process` 按 `CommandLine` 匹配 `udp_capture` 并 `Stop-Process` 结束。
 
 ### P5. 色彩看门狗（根治偶发蓝紫偏）
 - 源码版 esp32-camera 的 `set_wb_mode` 写入的 DSP 寄存器表与本 OV2640 模块不兼容，偶发 UV 增益损坏且 API 无法回写恢复。

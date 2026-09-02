@@ -16,6 +16,6 @@
 | `sniff_frames.py` / `sniff_com.py` / `cmd_*.py` | 帧/串口/命令嗅探调试 | - |
 | `gui_style_check.py` | **GUI 深色主题渲染自检**（截图核对配色/滑杆/徽章） | `python gui_style_check.py [输出.png]` |
 
-> 说明：这些脚本多为开发期一次性诊断，已不随主程序维护；**生产链路请使用 `../live_capture.py`**。
+> 说明：这些脚本多为开发期一次性诊断，已不随主程序维护；**生产链路请使用 `../udp_capture.py`**。
 > 维护记录（2026-09）：`_diag_*.py`（中继/P2P 排障临时脚本）与重复的 `diag_structure.py`、废弃的 `run_preview.bat` 已清理删除；帧协议解析 / RGB565 转换等公共逻辑已收敛到 `../lib/`。
 > 原始字节样本 `dump_boot.txt` 存档于此。
