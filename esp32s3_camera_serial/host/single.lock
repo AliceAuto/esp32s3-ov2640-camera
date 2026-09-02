@@ -1,0 +1,20 @@
+﻿正在局域网自动发现摄像头 (UDP:9999)...
+reader + decode_worker 线程已启动, 等待串口...
+局域网未发现摄像头, 自动回退中继兜底
+经中继观看: cam-1DCD23D8 (via 8.148.79.85:8001)
+串口已打开
+[dbg] FIRST chunk 2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00\x00\x00\x00\x00\x00\xff'
+[dbg] read=127215B/2s parsed=54 valid=54 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=138780B/2s parsed=60 valid=60 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=150345B/2s parsed=65 valid=65 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=145719B/2s parsed=63 valid=63 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=141093B/2s parsed=61 valid=61 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=69390B/2s parsed=30 valid=30 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=92520B/2s parsed=40 valid=40 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=124902B/2s parsed=54 valid=54 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=127215B/2s parsed=55 valid=55 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=87894B/2s parsed=38 valid=38 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=67077B/2s parsed=29 valid=29 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=124902B/2s parsed=54 valid=54 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=203544B/2s parsed=88 valid=88 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'
+[dbg] read=173475B/2s parsed=75 valid=75 lastCh=2313B head=b'FRAME_BEGIN\nSIZE 160 120 JPG\n\xff\xd8\xff\xe0\x00\x10JFIF\x00' tail=b'\x00\x00\x00\x00\xff\xd9FRAME_END\n'

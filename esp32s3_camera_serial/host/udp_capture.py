@@ -72,6 +72,11 @@ def res_label(name):
 RES_LABELS = [res_label(n) for n in RES_INFO]
 def code_of(label):
     return RES_INFO[label.split()[0]][0]
+def label_of_code(code):
+    for n, (cd, w, h) in RES_INFO.items():
+        if cd == code:
+            return f"{n} {w}x{h}"
+    return RES_LABELS[1]
 
 PHOTO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photos")
 RECONNECT_AFTER = 4.0        # 预览停流超此秒数 -> TCP 重连并重下发命令
@@ -89,6 +94,10 @@ G = {
     "drops": 0,              # 按帧序号缺口估算的链路丢帧数
     "photo_pending": False,  # 已发 P 待收照片: 下一个完整 TCP 帧单元路由给照片而非预览
     "auto_q": True,          # AUTOQ 状态跟踪: 与固件 g_auto_quality 保持一致(默认 ON)
+    # 权威当前状态: 所有首连/重连都要把"用户 GUI 选的分辨率与手动画质"复现到固件,
+    # 杜绝重连时被命令行默认值覆盖、或 relay 重连不复现导致一直停在低画质。
+    "res_code": res_code or "t",   # 当前预览分辨率码(GUI 下拉选择为准)
+    "quality": 10,                 # 手动画质 q(auto 关时随重连复现)
 }
 samples = deque(maxlen=1024)         # (t, bytes) 完整帧滚动记录
 up_samples = deque(maxlen=512)       # 上屏时刻滚动记录(与 samples 同 5s 窗口口径)
@@ -263,6 +272,21 @@ def _clear_rxbuffers():
 def mode_cmd(code=None):
     s = ("v" + code) if code else ""
     return s + ("U" if G["mode"] == "UDP" else "N")
+
+
+def _qbyte():
+    return max(8, min(63, G["quality"]))
+
+
+def _resync_bytes():
+    """把"当前 GUI 选择"编成固件命令(重连/首连复现用)。
+
+    只含分辨率 + (auto 关时)手动画质。中继通道不发 UDP/TCP 模式后缀(避免改动
+    udp_mode 影响中继推流); 局域网直连用 mode_cmd 走各自模式后缀。"""
+    buf = bytearray(b"v" + G["res_code"].encode())
+    if not G["auto_q"]:
+        buf += b"q" + bytes([_qbyte()])
+    return bytes(buf)
 
 
 def send_cmd(data):
@@ -456,18 +480,20 @@ def open_relay(stop_ev):
 
 
 def open_tcp_cmd(stop_ev):
-    # 初始命令必须带默认预览分辨率: 固件分辨率是状态化的, 上次会话/误触会残留
-    # (如 UXGA 1600x1200), 启动时若只发 'U' 不切分辨率, 固件继续发大帧, 链路
-    # 帧率会掉到 2-3fps。默认拉回 QVGA; 命令行显式指定 res_code 时以它为准。
-    initial_cmd = mode_cmd(res_code or "t")
+    # 首连/重连时把"用户 GUI 当前选择"复现到固件: 分辨率按 G["res_code"](非命令行
+    # 默认值), auto 关时再带上手动画质。固件分辨率是状态化的(上次会话/误触会残留,
+    # 如 UXGA 1600x1200), 不发分辨率的纯 'U' 会导致固件继续发大帧、帧率掉到 2-3fps。
+    buf = mode_cmd(G["res_code"]).encode()
+    if not G["auto_q"]:
+        buf += b"q" + bytes([_qbyte()])
     for _ in range(600):
         if stop_ev.is_set():
             return None
         try:
             c = socket.create_connection((host, port), timeout=4)
             c.settimeout(0.05)
-            c.sendall(initial_cmd.encode())
-            print(f"TCP 已连 {host}:{port}, 已发 {initial_cmd!r}", flush=True)
+            c.sendall(buf)
+            print(f"TCP 已连 {host}:{port}, 已复现 {buf!r}", flush=True)
             return c
         except OSError:
             time.sleep(1.0)
@@ -476,17 +502,19 @@ def open_tcp_cmd(stop_ev):
 
 def _open_lan_tcp(ip_, stop_ev):
     """局域网直连预览: 打开摄像头 TCP 3333 命令/流通道(与中继同为 FRAME_BEGIN 帧,
-    _pump_bytes 解析)。打开后立即一次性对齐板子: 'N' 让板子走 TCP 推流(而非被别的
-    客户端设成 UDP 模式), 并带默认预览分辨率, 避免收到的帧尺寸与 GUI 不符被丢弃。"""
-    cmd = ("V" + (res_code or "t") + "N").encode()
+    _pump_bytes 解析)。打开后立即复现 GUI 当前状态: 'N' 让板子走 TCP 推流(而非被别
+    的客户端设成 UDP 模式), 分辨率按 G["res_code"], auto 关时带手动画质。"""
+    buf = ("V" + G["res_code"] + "N").encode()
+    if not G["auto_q"]:
+        buf += b"q" + bytes([_qbyte()])
     for _ in range(10):
         if stop_ev.is_set():
             return None
         try:
             c = socket.create_connection((ip_, 3333), timeout=4)
             c.settimeout(0.05)
-            c.sendall(cmd)
-            print(f"局域网直连已连 {ip_:}:3333, 已发 {cmd!r}", flush=True)
+            c.sendall(buf)
+            print(f"局域网直连已连 {ip_}:3333, 已复现 {buf!r}", flush=True)
             return c
         except OSError:
             time.sleep(1.0)
@@ -565,6 +593,7 @@ def _reader_body(stop_ev):
         if relay is None:
             return
         G["relay"] = relay
+        send_cmd(_resync_bytes())          # 首连即把 GUI 当前分辨率/手动画质复现到固件
         last_good = time.time()
         while not stop_ev.is_set():
             now = time.time()
@@ -580,6 +609,7 @@ def _reader_body(stop_ev):
                     break
                 G["relay"] = relay
                 _clear_rxbuffers()
+                send_cmd(_resync_bytes())  # 重连后同样复现, 不会退回固件残留的低画质
                 last_good = time.time()
             data = relay.read(65536)
             if data:
@@ -796,7 +826,7 @@ def build_ui(root):
     Gs.section_label(tb, "预览:").pack(side="left")
     # width 需容纳 "UXGA 1600x1200" 这类带尺寸标签, 否则选中框显示被截断
     res_cb = ttk.Combobox(tb, values=RES_LABELS, state="readonly", width=14)
-    res_cb.set(res_label("QVGA")); res_cb.pack(side="left", padx=(4, 12))
+    res_cb.set(label_of_code(G["res_code"])); res_cb.pack(side="left", padx=(4, 12))
     ui["res_cb"] = res_cb
 
     # AUTOQ 与手动互斥的 UI 同步(先定义, 画质栏初始化时立即调用)
@@ -811,7 +841,7 @@ def build_ui(root):
                               command=lambda: on_auto_q(auto_var.get()))
     auto_cb.pack(side="left", padx=(4, 0))
     ui["auto_var"], ui["auto_cb"] = auto_var, auto_cb
-    q_var = tk.IntVar(value=10)
+    q_var = tk.IntVar(value=G["quality"])
     q_scale = ttk.Scale(tb, from_=8, to=40, variable=q_var, length=110)
     q_scale.pack(side="left", padx=(4, 2))
     q_lbl = ttk.Label(tb, text=str(q_var.get()), width=3)
@@ -854,16 +884,18 @@ def build_ui(root):
     # ---- 事件绑定 ----
     def on_mode(_ev=None):
         G["mode"] = mode_cb.get()
+        G["res_code"] = code_of(res_cb.get())   # 记住当前选择, 供重连复现
         _clear_rxbuffers()
         if G["mode"] == "TCP":
             prev_q.queue.clear()          # 切 TCP 清掉 UDP 残留画面
-        cmd = mode_cmd(code_of(res_cb.get()))
+        cmd = mode_cmd(G["res_code"])
         if send_cmd(cmd):
             print(f"模式切换 -> {G['mode']}: {cmd!r}", flush=True)
     mode_cb.bind("<<ComboboxSelected>>", on_mode)
 
     def on_res(_ev=None):
-        cmd = mode_cmd(code_of(res_cb.get()))
+        G["res_code"] = code_of(res_cb.get())   # 记住当前选择, 供重连复现
+        cmd = mode_cmd(G["res_code"])
         if send_cmd(cmd):
             print(f"分辨率 -> {res_cb.get()}: {cmd!r}", flush=True)
     res_cb.bind("<<ComboboxSelected>>", on_res)
@@ -872,6 +904,7 @@ def build_ui(root):
     def on_q_release(_ev=None):
         v = max(8, min(40, int(q_var.get())))
         q_lbl.config(text=str(v))
+        G["quality"] = v                        # 记住手动画质, 供重连复现
         if send_cmd(bytes([v])):
             print(f"quality -> {v}", flush=True)
     q_scale.bind("<ButtonRelease-1>", on_q_release)
