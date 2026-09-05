@@ -106,22 +106,28 @@ def build_ui(root):
     ui["badge"], ui["info"] = badge, info
 
     # ---- 事件绑定 ----
+    def _build_switch_cmd():
+        """生成当前传输模式下的切换命令: 直连发 v[code][U/N], 中继只发 v[code]。"""
+        if core._relay_on[0]:
+            return core._resync_bytes()
+        return core.mode_cmd(core.G["res_code"])
+
     def on_mode(_ev=None):
         core.G["mode"] = mode_cb.get()
         core.G["res_code"] = code_of(res_cb.get())   # 记住当前选择, 供重连复现
         core._clear_rxbuffers()
         if core.G["mode"] == "TCP":
             core.prev_q.queue.clear()          # 切 TCP 清掉 UDP 残留画面
-        cmd = core.mode_cmd(core.G["res_code"])
+        cmd = _build_switch_cmd()
         if core.send_cmd(cmd):
             print(f"模式切换 -> {core.G['mode']}: {cmd!r}", flush=True)
     mode_cb.bind("<<ComboboxSelected>>", on_mode)
 
     def on_res(_ev=None):
         core.G["res_code"] = code_of(res_cb.get())   # 记住当前选择, 供重连复现
-        # 固件全量重建(deinit+init)需 0.5~1s, 期间帧流中断; 设 3s 宽限期避免停流误判断连
+        # 固件全量重建(deinit+init)需 0.5~1s, 期间帧流中断; 设 3s 宽限期避免停流误判未连
         core.G["res_grace_until"] = time.time() + 3.0
-        cmd = core.mode_cmd(core.G["res_code"])
+        cmd = _build_switch_cmd()
         if core.send_cmd(cmd):
             print(f"分辨率 -> {res_cb.get()}: {cmd!r}", flush=True)
     res_cb.bind("<<ComboboxSelected>>", on_res)
