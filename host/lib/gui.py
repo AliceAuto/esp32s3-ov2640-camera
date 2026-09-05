@@ -112,6 +112,11 @@ def build_ui(root):
             return core._resync_bytes()
         return core.mode_cmd(core.G["res_code"])
 
+    def _mark_switching():
+        # 切换命令已发出: 记录切换前最后帧时刻, 徽章显示"切换中"直到新帧到达。
+        core.G["switch_pending"] = True
+        core.G["switch_last_good"] = core.G["last_good"]
+
     def on_mode(_ev=None):
         core.G["mode"] = mode_cb.get()
         core.G["res_code"] = code_of(res_cb.get())   # 记住当前选择, 供重连复现
@@ -120,6 +125,7 @@ def build_ui(root):
             core.prev_q.queue.clear()          # 切 TCP 清掉 UDP 残留画面
         cmd = _build_switch_cmd()
         if core.send_cmd(cmd):
+            _mark_switching()
             print(f"模式切换 -> {core.G['mode']}: {cmd!r}", flush=True)
     mode_cb.bind("<<ComboboxSelected>>", on_mode)
 
@@ -129,6 +135,7 @@ def build_ui(root):
         core.G["res_grace_until"] = time.time() + 3.0
         cmd = _build_switch_cmd()
         if core.send_cmd(cmd):
+            _mark_switching()
             print(f"分辨率 -> {res_cb.get()}: {cmd!r}", flush=True)
     res_cb.bind("<<ComboboxSelected>>", on_res)
 
@@ -349,8 +356,17 @@ def render_loop(root):
         res = ui["res_cb"].get()
         connected = core.G["tcp"] is not None or core.G["relay"] is not None
         alive = connected and (now - core.G["last_good"] < core.RECONNECT_AFTER)
+        # 切换中判定: 已发切换命令, 且还没收到比"切换前最后帧"更新的帧。
+        # 一旦新帧到达(时间戳超过快照)即清除, 避免徽章在慢路径重建期卡死在"实时"。
+        if core.G["switch_pending"]:
+            if core.G["last_good"] > core.G["switch_last_good"]:
+                core.G["switch_pending"] = False
+            elif now - core.G["switch_last_good"] > core.RECONNECT_AFTER:
+                core.G["switch_pending"] = False   # 超时兜底: 切换失败/断流, 交给正常状态
         badge = ui["badge"]
-        if alive:
+        if core.G["switch_pending"]:
+            badge.config(text=" ◐ 切换中 ", bg=Gs.WARN)
+        elif alive:
             badge.config(text=" ● 实时 ", bg=Gs.OK)
         elif connected:
             badge.config(text=" ◐ 等帧 ", bg=Gs.WARN)
