@@ -102,9 +102,13 @@ void adapt_quality() {
   float target_fps;
   if (g_turn_mode || g_relay_viewer) {
     // 跨网路径 RTT 高、带宽受限, 目标帧率低于局域网, 但仍要尽力拉高
-    target_fps = (cur_frame >= FRAMESIZE_VGA) ? 8.0f : 20.0f;
+    target_fps = (cur_frame >= FRAMESIZE_VGA) ? 7.0f : 20.0f;
   } else {
-    target_fps = (cur_frame >= FRAMESIZE_SVGA) ? 8.0f
+    // 局域网: 目标要贴着传感器/信道可达的甜点, 而非传感器名义上限 ——
+    // UXGA 传感器编码墙 15fps, 但 2.4GHz + UDP 分片信道墙更低(~5-8fps), 见 SOLUTIONS N7/C5。
+    // 定太高会导致永远"落后目标"而无限加大压缩到画质崩坏仍追不上, 反而更糊且更不稳。
+    target_fps = (cur_frame == FRAMESIZE_UXGA)  ? 10.0f
+                 : (cur_frame >= FRAMESIZE_SVGA) ? 10.0f
                  : (cur_frame >= FRAMESIZE_VGA)  ? 12.0f
                  : 25.0f;   // QQVGA/QVGA: 传感器上限 30fps
   }
@@ -127,7 +131,11 @@ void adapt_quality() {
   // 只微调, 避免低带宽链路下固定 ±2 造成的画质锯齿崩摆。
   float gap = target_fps - fps;                 // >0 落后于目标
   int step = (gap > 6.0f) ? 6 : (gap > 3.0f) ? 4 : 2;
-  if (fps < target_fps - 2.0f && congested && g_quality < 35) {
+  // 大分辨率画质上限放宽: UXGA 单帧本就大, 压缩上限 35 在信道拥塞时往往压不够,
+  // 分片数仍高达 ~25-37 片而显著亏帧。允许压到 40(仍高于钳制下限 8, 画质可接受)以
+  // 把单帧缩小到能让分片流水线跟上的程度 —— 画质损失换帧率, 保"能看到连续画面"。
+  const int quality_cap = (cur_frame >= FRAMESIZE_SVGA) ? 40 : 35;
+  if (fps < target_fps - 2.0f && congested && g_quality < quality_cap) {
     new_q = g_quality + step;   // 加大压缩 -> 单帧更小 -> 带宽不变时帧率提升
   } else if (!cross_net && fps > target_fps + 1.5f && !congested
              && kbps < 650.0f && g_quality > 8) {

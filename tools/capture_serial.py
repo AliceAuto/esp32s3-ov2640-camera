@@ -2,20 +2,24 @@
 """
 ESP32-S3 + OV2640 串口取图上位机
 从串口读取 FRAME_BEGIN ... FRAME_END 之间的 JPEG 数据，保存到本地 jpg 文件。
+切帧复用 lib/frame_parser（与预览/帧率测试同一份实现）。
 
 用法：
     python capture_serial.py [串口] [波特率] [保存目录]
 示例（Windows）：
     python capture_serial.py COM3 115200 shots
 """
-
-import sys
 import os
+import sys
 import time
+
+# 使 tools/ 下可 import host/lib 公共库(与主程序同一份帧解析实现)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "host"))
+
 import serial
 
-BEGIN = b"FRAME_BEGIN\n"
-END   = b"FRAME_END\n"
+from lib import frame_parser
+
 
 def main():
     port = sys.argv[1] if len(sys.argv) > 1 else "COM3"
@@ -26,7 +30,7 @@ def main():
     ser = serial.Serial(port, baud, timeout=1)
     print(f"已打开 {port}@{baud}，等待 FRAME_BEGIN ... (Ctrl+C 退出)")
 
-    buf = b""
+    buf = bytearray()
     poll_t = time.time()
 
     try:
@@ -34,29 +38,10 @@ def main():
             data = ser.read(4096)
             if data:
                 buf += data
-
-                # 处理可能的多帧：循环切出完整帧
-                while True:
-                    i_begin = buf.find(BEGIN)
-                    if i_begin == -1:
-                        # 丢弃累积的无效前缀，避免越搞越长（保留尾部可能不完整的 BEGIN）
-                        if len(buf) > 4 * len(BEGIN):
-                            keep = buf[-len(BEGIN):]
-                            for k in range(1, len(BEGIN)):
-                                if BEGIN[:k] == buf[-k:]:
-                                    keep = buf[-k:]
-                                    break
-                            buf = keep
-                        break
-                    j_end = buf.find(END, i_begin + len(BEGIN))
-                    if j_end == -1:
-                        # 收到了 BEGIN 但还没到 END，等待更多数据
-                        break
-
-                    jpeg = buf[i_begin + len(BEGIN):j_end]
-                    buf = buf[j_end + len(END):]
-
-                    if jpeg and jpeg.startswith(b"\xff\xd8"):
+                frames, consumed = frame_parser.split_frames(buf)
+                del buf[:consumed]
+                for w, h, fmt, jpeg in frames:
+                    if fmt == "JPG" and len(jpeg) > 100 and jpeg[:2] == b"\xff\xd8":
                         name = os.path.join(
                             outdir,
                             f"shot_{time.strftime('%Y%m%d_%H%M%S')}_{len(jpeg)}.jpg",
@@ -75,6 +60,7 @@ def main():
         print("\n已退出")
     finally:
         ser.close()
+
 
 if __name__ == "__main__":
     main()

@@ -3,7 +3,7 @@
 预览帧率命令行测试（UDP/TCP 双模式 + UDP 丢包统计）。
 
 用法:
-  python udp_fps.py [res] [quality] [duration] [host] [port] [mode]
+  python fps_test.py [res] [quality] [duration] [host] [port] [mode]
     res      分辨率码 q/t/v/s/x/u   (默认 v=VGA)
     quality  JPEG质量 0-63, 省略则不动
     duration 测试秒数               (默认 10)
@@ -15,8 +15,20 @@
   - TCP 连板子发命令(q<quality> + v<res> [+ U])
   - udp: 收 UDP 分片重组, 统计整帧帧率/帧长 + 丢片率
   - tcp: 不启 UDP, 收 TCP 帧流(可靠)统计帧率 -> 与 udp 对比可区分"丢包"与"传感器上限"
+
+帧协议复用 lib/protocol(OVU 头常量/帧校验) 与 lib/frame_parser(FRAME 切帧)。
+UDP 重组保留本地实现: 测试工具需要精确的丢片/残帧统计, 与主程序的 UdpAssembler 各司其职。
 """
-import sys, time, socket, re
+import os
+import socket
+import sys
+import time
+
+# 使 tools/ 下可 import host/lib 公共库(与主程序同一份帧协议实现)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "host"))
+
+from lib import frame_parser
+from lib import protocol
 
 res = sys.argv[1] if len(sys.argv) > 1 else "v"
 quality = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else -1
@@ -25,11 +37,9 @@ host = sys.argv[4] if len(sys.argv) > 4 else "192.168.10.118"
 port = int(sys.argv[5]) if len(sys.argv) > 5 else 3333
 mode = sys.argv[6] if len(sys.argv) > 6 else "udp"
 
-HDR = 12
-MAGIC = b"OVU"
-CHUNK = 1400 - HDR
-FB_END = b"FRAME_END\n"
-_FRAME = re.compile(rb'FRAME_BEGIN\nSIZE (\d+) (\d+) (\S+)\n(.*?)FRAME_END\n', re.S)
+HDR = protocol.HDR
+MAGIC = protocol.MAGIC
+CHUNK = protocol.CHUNK
 
 # 命令: q<quality> + v<res> + U/N (N 必须显式发: 板子 udp_mode 是全局态,
 # 若上次测试开过 U, TCP 模式不发 N 的话板子仍在 UDP 模式, TCP 连接收不到流)
@@ -37,7 +47,7 @@ cmd = b""
 if quality >= 0:
     cmd += b"q" + bytes([quality])
 cmd += ("v" + res).encode() + (b"U" if mode == "udp" else b"N")
-print(f"模式={mode} 命令: {cmd!r}  (res={res} quality={quality if quality>=0 else '-'})")
+print(f"模式={mode} 命令: {cmd!r}  (res={res} quality={quality if quality >= 0 else '-'})")
 
 
 def open_tcp():
@@ -88,8 +98,10 @@ if mode == "udp":
                 ctx = {"seq": None, "cnt": 0, "got": 0, "parts": None}
             if frames == last_frames and now - t0 > 4 and now - last_print > 1:
                 print("!! 4s 无帧, 尝试重连", flush=True)
-                try: tcp.close()
-                except Exception: pass
+                try:
+                    tcp.close()
+                except Exception:
+                    pass
                 tcp = open_tcp()
                 last_print = now
             continue
@@ -116,12 +128,7 @@ if mode == "udp":
             frame = b"".join(ctx["parts"])
             fw, fh, ffmt = w, h, fmt
             ctx = {"seq": None, "cnt": 0, "got": 0, "parts": None}
-            ok = False
-            if ffmt == 1:
-                ok = len(frame) > 100 and frame[:2] == b"\xff\xd8" and frame[-2:] == b"\xff\xd9"
-            else:
-                ok = len(frame) == fw * fh * 2 and fw > 0 and fh > 0
-            if ok:
+            if protocol.frame_ok(ffmt, frame, fw, fh):
                 frames += 1
                 total_len += len(frame)
         now = time.time()
@@ -135,7 +142,7 @@ if mode == "udp":
 else:
     # ---- TCP 模式: 可靠帧流 ----
     tcp.settimeout(0.2)
-    buf = b""
+    buf = bytearray()
     while time.time() - t0 < duration:
         try:
             d = tcp.recv(65536)
@@ -145,14 +152,12 @@ else:
             print("!! TCP 断开", flush=True)
             break
         buf += d
-        m = _FRAME.search(buf)
-        if m:
-            fw, fh, fmt = int(m.group(1)), int(m.group(2)), m.group(3)
-            ffmt = 1 if fmt == b"JPG" else 0
+        out, consumed = frame_parser.split_frames(buf)
+        del buf[:consumed]
+        for fw_, fh_, fmt_, body in out:
+            fw, fh, ffmt = fw_, fh_, (1 if fmt_ == "JPG" else 0)
             frames += 1
-            total_len += len(m.group(4))
-            buf = buf[m.end():]
-            # 校验 JPEG 完整性
+            total_len += len(body)
         now = time.time()
         if now - last_print >= 1.0:
             fps = (frames - last_frames) / (now - last_print)

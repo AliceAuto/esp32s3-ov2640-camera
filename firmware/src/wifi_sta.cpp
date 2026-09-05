@@ -36,6 +36,10 @@ void setup_wifi() {
   // 有凭据则保持纯 STA —— SoftAP 与 STA 时分复用同一射频, 会明显拉低视频吞吐。
   g_softap_on = (g_sta_ssid[0] == 0);
   if (g_softap_on) {
+    // 开热点前先在 STA 模式扫一次附近 WiFi 并缓存(单射频: AP 与扫描不能共存,
+    // 开了热点再扫会打断手机连接导致"扫描不到"), 配网页读缓存即可。
+    WiFi.mode(WIFI_STA);
+    wifi_scan_and_cache();
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS);
     Dbg.printf("[WiFi] 无 STA 凭据, 已开兜底热点 '%s' 供配网(配好后自动关闭)\n", AP_SSID);
@@ -52,6 +56,9 @@ void setup_wifi() {
   // Web 配置页(通过局域网 IP 访问)
   httpServer.on("/",         HTTP_GET, handle_web_root);
   httpServer.on("/save",     HTTP_GET, handle_web_save);
+  httpServer.on("/scan",     HTTP_GET, handle_web_scan);
+  httpServer.on("/test",     HTTP_GET, handle_web_test);
+  httpServer.on("/test_status", HTTP_GET, handle_web_test_status);
   httpServer.begin();
   Dbg.println("[WiFi] 配置页已开(局域网 IP:80)");
 
@@ -78,8 +85,19 @@ void setup_wifi() {
       Dbg.println("[WiFi] 已入网, 兜底热点关闭");
     }
   } else {
-    Dbg.printf("\n[WiFi] STA 连接超时, 设备离线%s\n",
-               g_softap_on ? "(兜底热点已开, 可连入配网)" : "(需重连/重新配置)");
+    // 连不上也自动开兜底热点: 手机连入后访问 192.168.4.1 重新配网,
+    // 避免"有凭据但连不上 -> 纯 STA -> 死机"的配网死锁。
+    if (!g_softap_on) {
+      // 此刻仍处于 STA 模式(刚 connect 失败), 先扫附近 WiFi 缓存, 再切 AP_STA
+      wifi_scan_and_cache();
+      WiFi.mode(WIFI_AP_STA);
+      WiFi.softAP(AP_SSID, AP_PASS);
+      g_softap_on = true;
+      Dbg.printf("\n[WiFi] STA 连接超时, 已自动开启兜底热点 '%s' (手机连入后访问 192.168.4.1 配网)\n",
+                 AP_SSID);
+    } else {
+      Dbg.printf("\n[WiFi] STA 连接超时, 兜底热点已开, 可连入配网\n");
+    }
   }
 }
 
@@ -107,4 +125,12 @@ void check_sta_link() {
   WiFi.disconnect();
   delay(50);
   WiFi.begin(g_sta_ssid, g_sta_pass);
+  // 掉线重连期间若尚未开热点, 也自动开兜底热点, 保证随时可连入配网
+  if (!g_softap_on) {
+    wifi_scan_and_cache();   // 掉线时同样先扫缓存再开热点, 供配网页选网
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    g_softap_on = true;
+    Dbg.printf("[WiFi] 掉线重连, 自动开启兜底热点 '%s'\n", AP_SSID);
+  }
 }

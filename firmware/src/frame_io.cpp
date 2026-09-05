@@ -75,9 +75,11 @@ static bool send_frame_udp_locked(camera_fb_t *fb, WiFiUDP &u, IPAddress dst, ui
   ovu_build_header(pkt, (pixformat_t)fb->format, udp_seq, nchunk, fb->width, fb->height);
 
   const bool small_frame     = (nchunk <= 4);
+  // 重试预算按帧大小成比例: 大帧分片多, 单片瞬时 TX-full(ERR_MEM) 不应整帧作废。
+  // 小帧 6 片*2ms; 大帧给每片 1 次即时重试即可, 不做长阻塞(阻塞越久采集流水线越饿)。
   const int  max_retry       = small_frame ? 6 : 1;
   const int  retry_delay_ms  = small_frame ? 2 : 1;
-  const int  retry_budget_ms = small_frame ? 6 : 3;    // 整帧重试总预算(ms), 小帧 10->6 减少队列阻塞
+  const int  retry_budget_ms = small_frame ? 6 : 2;    // 大帧重试预算放宽到 2ms(单片瞬时重试), 不加长阻塞
   int budget_used = 0;
   size_t off = 0;
   for (size_t i = 0; i < nchunk && off < len; i++) {
@@ -104,7 +106,10 @@ static bool send_frame_udp_locked(camera_fb_t *fb, WiFiUDP &u, IPAddress dst, ui
     }
     if (!sent) {
       g_diag_skip_frames++;
-      if (!small_frame) g_udp_backoff_frames = 3;
+      // 背压信号不要夸张: 一次 TX 失败就整帧丢弃会令 >4 片的大帧(UXGA ~37 片)在
+      // 拥塞瞬间成片触发级联——每次失败再吞掉此后 3 帧, 帧率会掉到 1 帧量级。
+      // 改为最多退避 1 帧 + 立刻让自适应画质降档压缩(减小后续单帧/分片数)。
+      if (!small_frame) g_udp_backoff_frames = 1;
       return false;
     }
     off += n;

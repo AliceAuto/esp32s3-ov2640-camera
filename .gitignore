@@ -1,9 +1,7 @@
 # ========== 编译产物 ==========
-# Arduino/PlatformIO 构建目录（所有变体）
-esp32s3_camera_serial/build/
-esp32s3_camera_serial/build*/
-esp32s3_camera_pio/.pio/
-esp32s3_camera_pio/.pio/libdeps/
+# PlatformIO 构建目录（所有变体）
+firmware/.pio/
+firmware/.pio/libdeps/
 
 # 编译输出文件
 *.bin
@@ -39,14 +37,11 @@ tools/package_esp32_index_local.json
 tools/arduino-cli.exe
 
 # ========== 厂商资料（体积大，无需入库） ==========
-资料/
+vendor/
 
 # ========== 上位机输出 ==========
-esp32s3_camera_serial/host/shots/
-esp32s3_camera_serial/host/photos/
+host/shots/
+host/photos/
 
 # ========== 本地凭据（不入库） ==========
-esp32s3_camera_pio/src/secrets.h
-
-# ========== 库源码副本 ==========
-esp32s3_camera_serial/libraries/
+firmware/src/secrets.h

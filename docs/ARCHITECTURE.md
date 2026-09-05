@@ -12,7 +12,7 @@
 - **采集**：OV2640 DVP 接口，硬件 JPEG 编码，PSRAM 帧缓冲，RGB565 可由编译开关切换。
 - **主控**：ESP32-S3（双核 240MHz，8MB OPI PSRAM），FreeRTOS（Arduino 框架）。
 - **传输**：四类通道并存 —— 串口 UART0 2Mbaud、局域网 WiFi TCP、局域网 WiFi UDP（高帧率）、公网中继（跨网，含 P2P/TURN）。
-- **上位机**：Python3 + tkinter + Pillow，`udp_capture.py` 实时预览/分辨率切换/一键拍照。
+- **上位机**：Python3 + tkinter + Pillow，`main.py` 实时预览/分辨率切换/一键拍照。
 
 ```
                     ┌────────────────────────────────────────────┐
@@ -24,25 +24,30 @@
                    └────────────────────────────────────────────┘        └─▶ 公网中继 / P2P/TURN
                                               │ (中继命令下行)
                                               ▼
-                                   relay_server.py (云)
+                                 server/relay_server.py (云)
                                               │
                                               ▼
-                                   host/udp_capture.py (终端)
+                                       host/main.py (终端)
 ```
 
 ---
 
 ## 2. 目录结构
 
-- `esp32s3_camera_pio/` — **当前固件**（PlatformIO，从源码编译 esp32-camera，解锁 JPEG）
+- `firmware/` — **当前固件**（PlatformIO，从源码编译 esp32-camera，解锁 JPEG）
   - `platformio.ini` — 编译配置；`src/main.cpp` — 固件主体
-- `esp32s3_camera_serial/host/` — **Python 上位机工具集**
-  - `udp_capture.py` — 主预览程序（串口 / WiFi / UDP / 中继均可）
-  - `archive/` — 旧 Arduino `.ino` 固件与历史维护文档（归档存证）
-- `relay_server.py` — **跨网信令 + 中继服务端**（云服务器运行）
+- `host/` — **上位机（唯一入口 `main.py` + 模块库 `lib/`）**
+  - `main.py` — 入口：CLI 解析 → 写入 `lib.core` 配置 → 装配 GUI/收流/解码三线程
+  - `lib/` — 模块库：`core`(状态/帧路由/命令/统计)、`reader`(收流编排)、`gui`(界面/渲染/拍照)、`protocol`(OVU 分片协议)、`frame_parser`(切帧)、`relay_client`(中继)、`netio`(网络 IO)、`watchdog`(色彩看门狗)、`rgb565`、`gui_style`
+- `server/` — **跨网信令 + 中继服务端**（云服务器运行）
+  - `relay_server.py` — 服务端主体（信令 / TCP 中继 / P2P/TURN）
 - `deploy/` — 中继服务部署与量化测试工具（`relay_fps.py`、`test_switch.py` 等）
 - `docs/` — 本体系结构与解决方案文档
-- `tools/` — 本地工具链（arduino-cli 等，不入库）
+- `tools/` — 工具脚本 + 本地工具链
+  - `preview_serial.py` / `capture_serial.py` — 串口预览 / 串口取图
+  - `fps_test.py` — 局域网 UDP/TCP 帧率对比测试（原 udp_fps.py）
+  - `arduino-cli` 等工具链（不入库）
+- `vendor/` — 厂商资料（选型/手册/参考代码，不入库）
 
 ---
 
@@ -91,7 +96,7 @@ FRAME_END\n
 ```
 
 - 上位机按正则 `FRAME_BEGIN\nSIZE ...\n(.*?)FRAME_END\n` 切帧；`JPG` 校验 `FF D8`/`FF D9` 后解码，`RGB` 按 big-endian 解析 RGB565。
-- 中继（`relay_server.py`）采用 **4 字节大端长度前缀 + payload** 的透传协议，不解析视频帧，因此与局域网帧格式解耦。**任何消息不允许中途放弃**，否则整条流错位（见 SOLUTIONS）。
+- 中继（`server/relay_server.py`）采用 **4 字节大端长度前缀 + payload** 的透传协议，不解析视频帧，因此与局域网帧格式解耦。**任何消息不允许中途放弃**，否则整条流错位（见 SOLUTIONS）。
 
 ### 3.4 分辨率与自适应缓冲
 
@@ -128,7 +133,7 @@ FRAME_END\n
 摄像头每 3s 向 `255.255.255.255:9999` UDP 广播 `OV2640|名字|IP`，上位机监听几秒自动直连。
 
 ### 4.4 跨网中继（`--relay`）
-- 摄像头常驻 TCP 连接公网 `relay_server.py` 并注册 id（默认 `cam-<MAC尾>`）；有观众 `watch` 时上行帧、透传下行命令。
+- 摄像头常驻 TCP 连接公网 `server/relay_server.py` 并注册 id（默认 `cam-<MAC尾>`）；有观众 `watch` 时上行帧、透传下行命令。
 - 无本地客户端时服务中继观众；一台摄像头同一时刻服务一个观看端。
 - 服务端只做 `4B 长度前缀 + payload` 字节透传，与局域网帧协议兼容。
 
@@ -138,12 +143,13 @@ FRAME_END\n
 
 ---
 
-## 5. 上位机架构（`host/udp_capture.py`）
+## 5. 上位机架构（`host/main.py`）
 
-- **传输通道抽象**：位置参数 + 开关选择串口 / `--wifi` / `--auto` / `--relay`，共用同一 `FRAME/SIZE/END` 帧解析。
-- **最新帧优先队列**：`queue.Queue(maxsize=2)` + `put_latest()`，满则丢最旧，渲染永不滞后。
-- **实时帧率统计**：每秒结算窗口，界面底部显示当前 fps。
-- **三级自动重连**：串口异常重开 → 5s 无帧强制重连 → 重连首帧后 `resync_board()` 重新下发分辨率，兜底裸板触碰短路复位。
+- **模块拆分**：`main.py` 只留「CLI 解析 + 自检 + 装配」，逻辑按职责下沉 `host/lib/`：`core`(运行时配置/共享状态/帧路由/命令/统计)、`reader`(收流编排 UDP·TCP·中继)、`gui`(界面/渲染/拍照)、`protocol`(OVU UDP 分片重组/分辨率表)、`frame_parser`(FRAME_BEGIN/END 切帧)、`relay_client`(中继 RelayIo)、`netio`(局域网发现/命令通道)、`watchdog`(色彩看门狗)、`rgb565`、`gui_style`。
+- **传输通道抽象**：位置参数 + 开关选择局域网 `--wifi` / 跨网 `--relay` / 局域网优先回退 `--lanrelay`，共用同一 `FRAME/SIZE/END` 帧解析。
+- **最新帧优先队列**：`queue.Queue(maxsize=2)` + `_put_latest()`，满则丢最旧，渲染永不滞后。
+- **实时帧率统计**：5s 滚动窗口，状态栏实时显示链路/上屏 fps 与带宽。
+- **状态复现式重连**：首连/重连都把 GUI 当前分辨率与手动画质重新下发固件（`open_tcp_cmd`/`_open_lan_tcp`），杜绝重连后停在固件残留的低画质；局域网会话断流自动回退中继兜底。
 - **色彩看门狗**：B 通道显著偏蓝持续 3s 自动下发 `r` 完整重建（应对源码版 esp32-camera 的 AWB 表兼容问题，约 5s 自愈）。
 - **远端解析约束**：RGB565 必须 big-endian：`v = (b[i]<<8) | b[i+1]`；JPG 校验 SOI/EOI。切勿改回 little-endian（整体花屏）。
 

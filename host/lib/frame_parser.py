@@ -8,7 +8,7 @@
     FRAME_END\n
 
 用 find() 定位定界符 + 切片(一次线性扫描), 不用正则回溯 —— 高分辨率下
-正则 .*? 的匹配开销是此前 live_capture 卡顿的来源之一。
+正则 .*? 的匹配开销是此前单文件客户端卡顿的来源之一。
 """
 BEGIN = b"FRAME_BEGIN\n"
 END = b"FRAME_END\n"

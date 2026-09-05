@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """跨网观看探针: 以观众身份连中继, watch 真实摄像头, 连收几帧校验视频能流下来。"""
-import socket, json, sys, time
+import socket, json, sys
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "8.148.79.85"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8001

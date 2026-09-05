@@ -19,17 +19,22 @@
 
 ```
 ov2640/
-├── esp32s3_camera_pio/          # 当前固件（PlatformIO，源码编译 esp32-camera，解锁 JPEG）
+├── firmware/                    # 固件（PlatformIO，源码编译 esp32-camera，解锁 JPEG）
 │   └── src/main.cpp             # 固件主体
-├── esp32s3_camera_serial/host/  # Python 上位机工具集
-│   └── udp_capture.py           # 主预览程序（串口/WiFi/UDP/中继）
-├── relay_server.py              # 跨网信令 + 中继服务端（云服务器）
+├── host/                        # 上位机（入口 main.py + 模块库 lib/）
+│   ├── main.py                  # 主预览程序（WiFi TCP/UDP / 跨网中继 / 自动发现）
+│   └── lib/                     # 模块库（core 状态/reader 收流/gui 界面/protocol/切帧/中继/主题等）
+├── server/                      # 云中继服务端（跨网信令 + P2P/TURN 转发）
+│   └── relay_server.py          # 中继服务端主体（云服务器运行）
 ├── deploy/                      # 部署与量化测试工具（relay_fps.py、test_switch.py 等）
 ├── docs/                        # 体系结构与解决方案文档
-└── archive/                     # 旧 Arduino .ino 固件 + 历史维护文档（存证）
+├── tools/                       # 工具脚本 + 本地工具链
+│   ├── preview_serial.py        # 串口轮询拍照预览
+│   ├── capture_serial.py        # 串口取图保存
+│   ├── fps_test.py              # 局域网 UDP/TCP 帧率对比测试
+│   └── (arduino-cli 等工具链，不入库)
+└── vendor/                      # 厂商资料（选型/手册/参考代码，不入库）
 ```
-
-> `esp32s3_camera_serial` 虽沿用旧名，现仅承载上位机 host 工具；旧的 Arduino 固件与维护文档已归档至 `archive/esp32s3_camera_serial/`。
 
 ***
 
@@ -38,33 +43,33 @@ ov2640/
 ### 编译 / 烧录固件（PlatformIO）
 
 ```bash
-cd esp32s3_camera_pio
+cd firmware
 pio run                 # 编译
-pio run -t upload       # 烧录（platformio.ini: upload_port = COM10）
+pio run -t upload       # 烧录（platformio.ini: upload_port = COM7）
 ```
 
 ### 运行预览
 
 ```bash
-cd esp32s3_camera_serial/host
+cd host
 
 # 跨网中继观看（推荐，需云中继在线）
-python udp_capture.py --relay 8.148.79.85:8001 --id cam-1DCD23D8
+python main.py --relay 8.148.79.85:8001 --id cam-1DCD23D8
 
 # 局域网 WiFi（TCP 可靠 / UDP 高帧率）
-python udp_capture.py --wifi 192.168.10.118 3333
+python main.py --wifi 192.168.10.118 3333
 
 # 局域网优先，失败自动回退中继
-python udp_capture.py --lanrelay
+python main.py --lanrelay
 
-# 串口（2Mbaud 基线）
-python udp_capture.py COM10
+# 串口轮询拍照预览（2Mbaud 基线，见 tools/preview_serial.py）
+python ../tools/preview_serial.py COM7
 ```
 
 ### 中继服务端（云服务器）
 
 ```bash
-python relay_server.py 8001 [token]   # TCP 8001 放行；token 可选鉴权
+python server/relay_server.py 8001 [token]   # TCP 8001 放行；token 可选鉴权
 ```
 
 ***

@@ -2,7 +2,7 @@
 """
 OV2640 上位机统一深色主题库。
 
-live_capture / udp_capture 两个 Tkinter 上位机共用同一套现代化深色风格,
+main.py(网络预览) / tools/preview_serial.py(串口预览) 两个 Tkinter 上位机共用同一套现代化深色风格,
 保证观感一致。本模块只负责"样式", 不涉及任何业务/协议逻辑。
 
 用法:

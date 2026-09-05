@@ -26,6 +26,7 @@
 #include "frame_io.h"       // 帧收发(OVU/TCP/串口)
 #include "web_cfg.h"        // Web 配置页 + NVS
 #include "wifi_sta.h"       // WiFi STA 接入
+#include "led.h"            // 板载 RGB 状态灯
 
 // ---- 函数原型（.ino 由 Arduino 自动生成，.cpp 需手动声明）----
 void handle_cmd(int c, Stream &in);
@@ -407,6 +408,7 @@ void setup() {
   Dbg.begin(2000000, SERIAL_8N1, RX_GPIO_NUM, TX_GPIO_NUM);
   Dbg.setTimeout(100);
   delay(500);
+  led_init();
 
   camera_config_t &config = g_config;
   memset(&config, 0, sizeof(config));
@@ -437,6 +439,7 @@ void setup() {
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Dbg.printf("摄像头初始化失败, err=0x%x\n", err);
+    led_show_error();
     while (true) { delay(100); }
   }
   Dbg.println("摄像头初始化成功 (JPEG)");
@@ -472,6 +475,12 @@ void setup() {
   g_diag_last_ms = millis();
   g_adapt_last_ms = millis();
   log_i("CAM setup done, tasks up");
+  // 初始灯态: 已入网=绿(短暂亮后灭), 否则若开了兜底热点=配网蓝呼吸
+  if (WiFi.status() == WL_CONNECTED) {
+    led_show_online();
+  } else if (g_softap_on) {
+    led_show_config();
+  }
 #endif
 }
 
@@ -517,8 +526,8 @@ static bool relay_send_iov(const uint8_t *p0, size_t n0,
       // s == 0: 缓冲满, 等腾出再发(只在该段未发完时阻塞, 不忙转)。
       delay(1);
       total_stall++;                  // I1: 统计最近写阻塞量(供大帧拥塞回避)
-      if (++stall >= 2000) {
-        ok = false;
+      if (++stall >= 5000) {          // 5s: 跨网经云中继, 延迟/抖动远大于局域网,
+        ok = false;                   // 2s 太激进导致频繁断连。5s 才判定链路真死。
         relay_cli.stop();             // 复位连接, 强制重建干净的中继流
         break;
       }
@@ -1040,9 +1049,20 @@ void handle_cmd(int c, Stream &in) {
     while (millis() - t0 < 200 && !in.available()) delay(1);
     if (!in.available()) { Dbg.println("V 缺分辨率码, 已忽略"); return; }
     char code = (char)in.read();
-    PREVIEW_FRAME = framesize_from_code(code);
-    camera_change_framesize(PREVIEW_FRAME);
-    Dbg.printf("预览分辨率已设为: %c\n", code);
+    framesize_t target = framesize_from_code(code);
+    // 相同分辨率直接跳过, 避免重连时 _resync 反复触发全量重建
+    if (target == cur_frame) {
+      Dbg.printf("预览分辨率未变(%c), 跳过\n", code);
+      return;
+    }
+    PREVIEW_FRAME = target;
+    if (camera_change_framesize(PREVIEW_FRAME)) {
+      Dbg.printf("预览分辨率已设为: %c\n", code);
+    } else {
+      // 切换失败(锁忙等): 回退 PREVIEW_FRAME, 防止重连 _resync 反复触发死循环
+      PREVIEW_FRAME = cur_frame;
+      Dbg.printf("预览分辨率切换失败, 回退到当前(%c)\n", code);
+    }
   } else if (c == 'h' || c == 'H') {
     long t0 = millis();
     while (millis() - t0 < 200 && !in.available()) delay(1);
@@ -1182,6 +1202,14 @@ void loop() {
       }
     }
     check_sta_link();
+    test_tick();   // 测试连接状态机(异步推进)
+    // 运行期灯态跟随: 已入网=绿, 否则开了兜底热点=配网蓝呼吸
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!g_softap_on) led_show_online();
+    } else if (g_softap_on) {
+      led_show_config();
+    }
+    led_update();
   }
 #endif
 
