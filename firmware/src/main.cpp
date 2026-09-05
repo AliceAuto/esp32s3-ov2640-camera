@@ -143,10 +143,17 @@ static volatile int  g_inflight   = 0;     // 发送方正持有的帧数(已出
 volatile bool        g_switching  = false; // 摄像头重建窗口, 生产侧暂停入队 [globals.h extern]
 volatile uint32_t   g_loop_tick  = 0;     // loop 心跳: sender_task 监控, 卡死则 ESP.restart 自愈
 
-// ---- 人体检测调度(阶段2) ----
-static uint32_t g_ai_last_infer_ms = 0;   // 上次推理时刻(节流)
-static uint8_t  g_ai_confirm_cnt   = 0;   // 连续判定"有人"的帧数(防抖)
-static volatile bool g_ai_trigger_photo = false;  // 推理命中, 待下轮 loop 不持锁时触发拍照
+// ---- 人体检测调度(阶段2+3) ----
+static uint32_t g_ai_last_infer_ms = 0;    // 上次推理时刻(节流)
+static uint8_t  g_ai_confirm_cnt   = 0;    // 连续判定"有人"的帧数(防抖)
+static volatile bool g_ai_trigger_photo = false;   // 推理命中, 待下轮 loop 不持锁时触发拍照
+static uint32_t g_ai_last_trigger_ms = 0;  // 上次触发拍照时刻(冷却)
+static uint32_t g_ai_cooldown_ms    = 10000;  // 触发冷却: 两次拍照/报警最小间隔(默认 10s)
+static bool     g_ai_relay_alert    = true;    // 命中后经中继发报警 JSON(开关)
+static uint32_t g_ai_hit_total      = 0;    // 累计命中次数(状态查询用)
+static uint32_t g_ai_infer_interval_ms = 1000;  // 推理节流间隔(默认 1s 一次)
+static uint32_t g_ai_last_infer_us   = 0;   // 最近一次推理耗时(us, 状态查询用)
+static uint32_t g_ai_infer_total     = 0;   // 累计推理次数
 
 // 发送成功统一记账（DIAG 周期窗口 + 自适应累计两套都递增）
 #endif
@@ -1161,6 +1168,72 @@ void handle_cmd(int c, Stream &in) {
     udp_mode = false;
     Dbg.println("UDP 预览模式关闭(TCP)");
 #endif
+  } else if (c == 'T' || c == 't') {
+    // AI 人体检测配置(阶段3): T+子命令
+    //   Ts      查询状态
+    //   Tt<0-100> 人置信度阈值(%)
+    //   Tf<1-10>  连续确认帧数(防抖)
+    //   Tc<0-255> 触发冷却(秒)
+    //   Ti<200-60000> 推理间隔(ms)
+    //   Tm      切换中继报警
+    long t0 = millis();
+    while (millis() - t0 < 200 && !in.available()) delay(1);
+    if (!in.available()) {
+      Dbg.println("T 缺子命令 (s/t/f/c/i/m)");
+      return;
+    }
+    char sub = (char)in.read();
+    if (sub == 's' || sub == 'S') {
+      Dbg.printf("AI: 阈值=%.0f%% 确认帧=%u 冷却=%us 推理间隔=%ums 中继报警=%s\n",
+                 g_ai_person_thresh * 100, (unsigned)g_ai_confirm_frames,
+                 (unsigned)(g_ai_cooldown_ms / 1000),
+                 (unsigned)g_ai_infer_interval_ms,
+                 g_ai_relay_alert ? "ON" : "OFF");
+      Dbg.printf("AI: 累计推理=%u 命中=%u 上次推理耗时=%ums\n",
+                 (unsigned)g_ai_infer_total, (unsigned)g_ai_hit_total,
+                 (unsigned)(g_ai_last_infer_us / 1000));
+    } else if (sub == 'i' || sub == 'I') {
+      long t1 = millis();
+      while (millis() - t1 < 200 && !in.available()) delay(1);
+      if (!in.available()) { Dbg.println("Ti 缺间隔ms"); return; }
+      int v = in.read();
+      if (v >= 200 && v <= 60000) {
+        g_ai_infer_interval_ms = (uint32_t)v;
+        Dbg.printf("AI 推理间隔=%ums\n", v);
+      } else Dbg.println("Ti 间隔须 200-60000ms");
+    } else if (sub == 't' || sub == 'T') {
+      long t1 = millis();
+      while (millis() - t1 < 200 && !in.available()) delay(1);
+      if (!in.available()) { Dbg.println("Tt 缺阈值%%"); return; }
+      int pct = in.read();
+      if (pct >= 0 && pct <= 100) {
+        g_ai_person_thresh = pct / 100.0f;
+        Dbg.printf("AI 阈值=%.0f%%\n", g_ai_person_thresh * 100);
+      } else Dbg.println("Tt 阈值须 0-100");
+    } else if (sub == 'f' || sub == 'F') {
+      long t1 = millis();
+      while (millis() - t1 < 200 && !in.available()) delay(1);
+      if (!in.available()) { Dbg.println("Tf 缺帧数"); return; }
+      int n = in.read();
+      if (n >= 1 && n <= 10) {
+        g_ai_confirm_frames = (uint8_t)n;
+        Dbg.printf("AI 确认帧=%u\n", (unsigned)g_ai_confirm_frames);
+      } else Dbg.println("Tf 帧数须 1-10");
+    } else if (sub == 'c' || sub == 'C') {
+      long t1 = millis();
+      while (millis() - t1 < 200 && !in.available()) delay(1);
+      if (!in.available()) { Dbg.println("Tc 缺冷却秒"); return; }
+      int s = in.read();
+      if (s >= 0 && s <= 255) {
+        g_ai_cooldown_ms = (uint32_t)s * 1000;
+        Dbg.printf("AI 冷却=%us\n", s);
+      } else Dbg.println("Tc 冷却须 0-255 秒");
+    } else if (sub == 'm' || sub == 'M') {
+      g_ai_relay_alert = !g_ai_relay_alert;
+      Dbg.printf("AI 中继报警 %s\n", g_ai_relay_alert ? "ON" : "OFF");
+    } else {
+      Dbg.println("T 子命令未知 (s/t/f/c/i/m)");
+    }
   }
 }
 
@@ -1279,15 +1352,40 @@ void loop() {
   // ---- 人体检测: 节流借帧推理(不影响主推流, 软解 JPEG 旁路) ----
   {
     uint32_t now = millis();
-    if (now - g_ai_last_infer_ms >= 1000) {   // 每秒最多推理一次
+    if (now - g_ai_last_infer_ms >= g_ai_infer_interval_ms) {
       g_ai_last_infer_ms = now;
+      uint32_t _t0 = micros();
       ai_result_t r = ai_detect_frame(fb);
+      uint32_t _t1 = micros();
+      g_ai_last_infer_us = _t1 - _t0;
+      g_ai_infer_total++;
       if (r.ok) {
         if (r.person) {
           if (++g_ai_confirm_cnt >= g_ai_confirm_frames) {
             g_ai_confirm_cnt = 0;
-            Dbg.printf("[AI] 检测到人(置信度 %.2f), 待触发拍照\n", r.person_score);
-            g_ai_trigger_photo = true;   // 只置标志, 由下轮 loop 在不持锁时消费
+            uint32_t now2 = millis();
+            if (now2 - g_ai_last_trigger_ms < g_ai_cooldown_ms) {
+              Dbg.printf("[AI] 检测到人(%.2f) 但冷却中, 跳过\n", r.person_score);
+            } else {
+              g_ai_last_trigger_ms = now2;
+              g_ai_hit_total++;
+              Dbg.printf("[AI] 检测到人(置信度 %.2f), 待触发拍照(累计命中 %u)\n",
+                         r.person_score, (unsigned)g_ai_hit_total);
+              // 中继报警: 复用现有 cmd_ack 可靠 JSON 通道(服务端原样转发给观众), 
+              // 不引入服务端不识别的 t 类型。观众端收到 {"t":"cmd_ack","res":"AI",...}
+              // 即“检测到人”事件。res 前缀 AI 与摄像头命令回执区分。
+              if (g_ai_relay_alert && g_relay_viewer) {
+                char _al[96];
+                int _n = snprintf(_al, sizeof(_al),
+                                  "{\"t\":\"cmd_ack\",\"res\":\"AI\",\"ok\":1,"
+                                  "\"score\":%d,\"hit\":%u}",
+                                  (int)(r.person_score * 100),
+                                  (unsigned)g_ai_hit_total);
+                relay_send_payload((const uint8_t*)_al, (size_t)_n);
+                Dbg.println("[AI] 中继报警已发送");
+              }
+              g_ai_trigger_photo = true;   // 只置标志, 由下轮 loop 在不持锁时消费
+            }
           }
         } else {
           g_ai_confirm_cnt = 0;

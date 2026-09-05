@@ -42,7 +42,7 @@ static uint8_t                    *s_tensor_arena = nullptr;
 
 // 可调参数(定义于本文件, 声明在 ai_detect.h)
 float   g_ai_person_thresh    = 0.6f;  // 人置信度阈值(0.0~1.0)
-uint8_t g_ai_confirm_frames   = 1;     // 连续确认帧数(阶段 3 调优用, 现为 1)
+uint8_t g_ai_confirm_frames   = 2;     // 连续确认帧数(防抖; 默认2帧/推理间隔1s=>需人持续~2s)
 
 bool ai_detect_init() {
   // 从数据映射模型(仅指针映射, 无拷贝/解析)
