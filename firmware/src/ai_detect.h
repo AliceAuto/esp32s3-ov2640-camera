@@ -11,6 +11,8 @@
 #pragma once
 #include <stdint.h>
 
+#include "esp_camera.h"
+
 // 模型输入尺寸(与训练时一致, 改模型需同步改)
 #define AI_IMG_W      96
 #define AI_IMG_H      96
@@ -30,6 +32,10 @@ bool ai_detect_init();
 // 喂一帧 96x96 灰度图(uint8, 0=黑 255=白)做一次推理。
 // 返回结果; 失败时 ok=false。
 ai_result_t ai_detect_once(const uint8_t *gray96);
+
+// 从一帧 JPEG 相机帧直接推理: 内部软解 JPEG -> 灰度 -> 缩到 96x96 -> 推理。
+// 不切换摄像头模式, 不影响主推流(仅从已抓到的帧旁路解一份)。
+ai_result_t ai_detect_frame(camera_fb_t *fb);
 
 // 判定阈值: person_score >= 该值才认为"有人"(0.0~1.0)。可在运行时调整。
 extern float g_ai_person_thresh;

@@ -15,6 +15,7 @@
 #include "tensorflow/lite/schema/schema_generated.h"
 
 #include "esp_heap_caps.h"
+#include "img_converters.h"
 
 // 模型权重(编译进 flash)。此头由例程提供: 声明 g_person_detect_model_data。
 #include "person_detect_model_data.h"
@@ -128,4 +129,50 @@ ai_result_t ai_detect_once(const uint8_t *gray96) {
   r.ok = true;
   r.person = (r.person_score >= g_ai_person_thresh);
   return r;
+}
+
+ai_result_t ai_detect_frame(camera_fb_t *fb) {
+  ai_result_t r;
+  r.ok = false;
+  r.person = false;
+  r.person_score = 0.0f;
+  r.not_person_score = 0.0f;
+
+  if (fb == nullptr || fb->buf == nullptr || fb->len == 0) return r;
+  if (s_interpreter == nullptr || s_input == nullptr) return r;
+
+  // 软解 JPEG -> RGB888(放 PSRAM, 不挤 SRAM)。fmt2rgb888 支持 JPEG 输入。
+  const int W = fb->width, H = fb->height;
+  if (W <= 0 || H <= 0) return r;
+  uint8_t *rgb = (uint8_t*)heap_caps_malloc((size_t)W * H * 3,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (rgb == nullptr) return r;   // PSRAM 不足, 放弃本帧推理
+
+  if (!fmt2rgb888(fb->buf, fb->len, fb->format, rgb)) {
+    heap_caps_free(rgb);
+    return r;   // 非 JPEG 或解码失败
+  }
+
+  // RGB888 -> 灰度 -> 缩到 96x96(中心裁剪 + 最近邻/双线性下采样)。
+  // 简化: 逐像素双线性采样映射到 96x96 网格, 取中心区域。
+  static uint8_t gray[AI_IMG_W * AI_IMG_H];
+  // 源区域取中心正方形(保证宽高比不畸变)
+  int side = (W < H) ? W : H;
+  int ox = (W - side) / 2;
+  int oy = (H - side) / 2;
+  for (int y = 0; y < AI_IMG_H; y++) {
+    int sy = oy + y * side / AI_IMG_H;
+    if (sy >= H) sy = H - 1;
+    for (int x = 0; x < AI_IMG_W; x++) {
+      int sx = ox + x * side / AI_IMG_W;
+      if (sx >= W) sx = W - 1;
+      const uint8_t *p = rgb + ((size_t)sy * W + sx) * 3;
+      // 标准灰度: 0.299R + 0.587G + 0.114B
+      gray[y * AI_IMG_W + x] =
+          (uint8_t)((p[0] * 299 + p[1] * 587 + p[2] * 114) / 1000);
+    }
+  }
+  heap_caps_free(rgb);
+
+  return ai_detect_once(gray);
 }

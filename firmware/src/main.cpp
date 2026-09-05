@@ -143,6 +143,11 @@ static volatile int  g_inflight   = 0;     // 发送方正持有的帧数(已出
 volatile bool        g_switching  = false; // 摄像头重建窗口, 生产侧暂停入队 [globals.h extern]
 volatile uint32_t   g_loop_tick  = 0;     // loop 心跳: sender_task 监控, 卡死则 ESP.restart 自愈
 
+// ---- 人体检测调度(阶段2) ----
+static uint32_t g_ai_last_infer_ms = 0;   // 上次推理时刻(节流)
+static uint8_t  g_ai_confirm_cnt   = 0;   // 连续判定"有人"的帧数(防抖)
+static volatile bool g_ai_trigger_photo = false;  // 推理命中, 待下轮 loop 不持锁时触发拍照
+
 // 发送成功统一记账（DIAG 周期窗口 + 自适应累计两套都递增）
 #endif
 
@@ -1221,6 +1226,13 @@ void loop() {
   }
 #endif
 
+  // ---- 人体检测触发: 消费推理命中的标志, 在“不持相机锁”时执行拍照 ----
+  if (g_ai_trigger_photo) {
+    g_ai_trigger_photo = false;
+    Dbg.println("[AI] 触发拍照");
+    handle_cmd('P', Dbg);
+  }
+
   // ---- 命令：串口 + TCP 都读 ----
   while (Dbg.available()) handle_cmd(Dbg.read(), Dbg);
 #ifdef ENABLE_WIFI
@@ -1263,6 +1275,27 @@ void loop() {
 #else
   send_frame(fb);
 #endif
+
+  // ---- 人体检测: 节流借帧推理(不影响主推流, 软解 JPEG 旁路) ----
+  {
+    uint32_t now = millis();
+    if (now - g_ai_last_infer_ms >= 1000) {   // 每秒最多推理一次
+      g_ai_last_infer_ms = now;
+      ai_result_t r = ai_detect_frame(fb);
+      if (r.ok) {
+        if (r.person) {
+          if (++g_ai_confirm_cnt >= g_ai_confirm_frames) {
+            g_ai_confirm_cnt = 0;
+            Dbg.printf("[AI] 检测到人(置信度 %.2f), 待触发拍照\n", r.person_score);
+            g_ai_trigger_photo = true;   // 只置标志, 由下轮 loop 在不持锁时消费
+          }
+        } else {
+          g_ai_confirm_cnt = 0;
+        }
+      }
+    }
+  }
+
   esp_camera_fb_return(fb);   // 无论是否入队都只归还一次
 #ifdef ENABLE_WIFI
   cam_unlock();
