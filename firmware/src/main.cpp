@@ -35,6 +35,7 @@ void enqueue_frame(camera_fb_t *fb);
 void wait_tx_idle(uint32_t timeout_ms);
 void sender_task(void *arg);
 void relay_task(void *arg);
+void ai_task(void *arg);
 bool send_frame_relay(camera_fb_t *fb);
 bool send_frame_udp_via_turn(camera_fb_t *fb);
 void p2p_punch();
@@ -154,6 +155,17 @@ static uint32_t g_ai_hit_total      = 0;    // 累计命中次数(状态查询�
 static uint32_t g_ai_infer_interval_ms = 1000;  // 推理节流间隔(默认 1s 一次)
 static uint32_t g_ai_last_infer_us   = 0;   // 最近一次推理耗时(us, 状态查询用)
 static uint32_t g_ai_infer_total     = 0;   // 累计推理次数
+
+// AI 快照(单槽): 采集循环节流 memcpy 最新 JPEG 帧到此处, 由 ai_task 后台消费。
+// 推理慢(库无 ESP-NN 优化约 4s/帧)也不影响采集: loop 只做 memcpy, 推理在核1空闲时间跑。
+static uint8_t  *g_ai_buf    = NULL;   // 最新帧 JPEG 副本(PSRAM)
+static size_t    g_ai_len    = 0;
+static uint16_t  g_ai_w      = 0, g_ai_h = 0;
+static uint8_t   g_ai_fmt    = 0;      // pixformat_t 转 uint8 存
+static int8_t    g_ai_slot   = -1;     // frame_alloc 返回的池槽号
+static SemaphoreHandle_t g_ai_mutex  = NULL;   // 保护快照的写/读/所有权转移
+static SemaphoreHandle_t g_ai_signal = NULL;   // 新帧到达信号(counting)
+static volatile bool g_ai_inuse = false;       // ai_task 正在用 buf(生产者勿 free)
 
 // 发送成功统一记账（DIAG 周期窗口 + 自适应累计两套都递增）
 #endif
@@ -492,6 +504,11 @@ void setup() {
   xTaskCreatePinnedToCore(disc_task,  "disc",  2048, NULL, 1, NULL, 0); // 局域网发现广播
   xTaskCreatePinnedToCore(relay_task, "relay", 3072, NULL, 1, NULL, 0); // 跨网中继(常驻)
   xTaskCreatePinnedToCore(diag_beat_task, "diagb", 3072, NULL, 1, NULL, 0); // UDP 诊断心跳(核0)
+  // 人体检测后台推理: 独立任务, 采集循环只喂快照不阻塞。推理慢(库无 ESP-NN 优化
+  // 约 4s/帧)也无妨 —— 挂核1 优先级0(最低), 只在 loopTask 等帧/DMA 的空闲时间跑。
+  g_ai_mutex  = xSemaphoreCreateMutex();
+  g_ai_signal = xSemaphoreCreateCounting(4, 0);
+  xTaskCreatePinnedToCore(ai_task, "ai", 8192, NULL, 0, NULL, 1);
   g_diag_last_ms = millis();
   g_adapt_last_ms = millis();
   log_i("CAM setup done, tasks up");
@@ -565,6 +582,82 @@ static bool relay_send_iov(const uint8_t *p0, size_t n0,
 
 void relay_send_payload(const uint8_t *data, size_t len) {
   relay_send_iov(data, len, NULL, 0, NULL, 0);
+}
+
+// ---- 人体检测后台推理任务(阶段4) ----
+// 独立于采集循环: 采集循环只 memcpy 最新 JPEG 帧进 g_ai_buf 快照, 本任务在核1
+// 空闲时间消费快照做软解+推理。推理慢(库无 ESP-NN 优化约 4s/帧)也不阻塞串流。
+void ai_task(void *arg) {
+  (void)arg;
+  while (true) {
+    if (!g_ai_signal || xSemaphoreTake(g_ai_signal, pdMS_TO_TICKS(2000)) != pdTRUE) {
+      continue;
+    }
+    // 转移快照所有权(取出后置空, 让采集循环可写下一帧)
+    uint8_t  *buf  = NULL;
+    size_t    len  = 0;
+    uint16_t  w = 0, h = 0;
+    uint8_t   fmt  = 0;
+    int8_t    slot = -1;
+    if (!g_ai_mutex || xSemaphoreTake(g_ai_mutex, portMAX_DELAY) != pdTRUE) continue;
+    if (!g_ai_buf) { xSemaphoreGive(g_ai_mutex); continue; }
+    buf  = g_ai_buf;  len  = g_ai_len;
+    w    = g_ai_w;    h    = g_ai_h;
+    fmt  = g_ai_fmt;  slot = g_ai_slot;
+    g_ai_buf = NULL;                 // 所有权转给本任务
+    g_ai_inuse = true;
+    xSemaphoreGive(g_ai_mutex);
+
+    // 构造帧头供软解 + 推理(慢, 但不阻塞采集)
+    camera_fb_t fb;
+    fb.buf = buf; fb.len = len; fb.width = w; fb.height = h;
+    fb.format = (pixformat_t)fmt;
+    uint32_t _t0 = micros();
+    ai_result_t r = ai_detect_frame(&fb);
+    uint32_t _t1 = micros();
+    g_ai_last_infer_us = _t1 - _t0;
+    g_ai_infer_total++;
+
+    // 触发判定(防抖 + 冷却 + 中继报警 + 置拍照标志)
+    if (r.ok) {
+      if (r.person) {
+        if (++g_ai_confirm_cnt >= g_ai_confirm_frames) {
+          g_ai_confirm_cnt = 0;
+          uint32_t now = millis();
+          if (now - g_ai_last_trigger_ms < g_ai_cooldown_ms) {
+            Dbg.printf("[AI] 检测到人(%.2f) 但冷却中, 跳过\n", r.person_score);
+          } else {
+            g_ai_last_trigger_ms = now;
+            g_ai_hit_total++;
+            Dbg.printf("[AI] 检测到人(置信度 %.2f), 待触发拍照(累计命中 %u, 推理 %ums)\n",
+                       r.person_score, (unsigned)g_ai_hit_total,
+                       (unsigned)(g_ai_last_infer_us / 1000));
+            if (g_ai_relay_alert && g_relay_viewer) {
+              char _al[96];
+              int _n = snprintf(_al, sizeof(_al),
+                                "{\"t\":\"cmd_ack\",\"res\":\"AI\",\"ok\":1,"
+                                "\"score\":%d,\"hit\":%u}",
+                                (int)(r.person_score * 100),
+                                (unsigned)g_ai_hit_total);
+              relay_send_payload((const uint8_t*)_al, (size_t)_n);
+              Dbg.println("[AI] 中继报警已发送");
+            }
+            g_ai_trigger_photo = true;
+          }
+        }
+      } else {
+        g_ai_confirm_cnt = 0;
+      }
+    }
+
+    // 归还快照缓冲, 解除 inuse
+    frame_free(buf, slot);
+    if (g_ai_mutex) {
+      xSemaphoreTake(g_ai_mutex, portMAX_DELAY);
+      g_ai_inuse = false;
+      xSemaphoreGive(g_ai_mutex);
+    }
+  }
 }
 
 // ---- 可靠 P2P: 候选 socket 初始化 ----
@@ -1349,47 +1442,24 @@ void loop() {
   send_frame(fb);
 #endif
 
-  // ---- 人体检测: 节流借帧推理(不影响主推流, 软解 JPEG 旁路) ----
+  // ---- 人体检测: 节流喂最新 JPEG 帧给后台 ai_task(只 memcpy, 不阻塞采集) ----
   {
     uint32_t now = millis();
     if (now - g_ai_last_infer_ms >= g_ai_infer_interval_ms) {
       g_ai_last_infer_ms = now;
-      uint32_t _t0 = micros();
-      ai_result_t r = ai_detect_frame(fb);
-      uint32_t _t1 = micros();
-      g_ai_last_infer_us = _t1 - _t0;
-      g_ai_infer_total++;
-      if (r.ok) {
-        if (r.person) {
-          if (++g_ai_confirm_cnt >= g_ai_confirm_frames) {
-            g_ai_confirm_cnt = 0;
-            uint32_t now2 = millis();
-            if (now2 - g_ai_last_trigger_ms < g_ai_cooldown_ms) {
-              Dbg.printf("[AI] 检测到人(%.2f) 但冷却中, 跳过\n", r.person_score);
-            } else {
-              g_ai_last_trigger_ms = now2;
-              g_ai_hit_total++;
-              Dbg.printf("[AI] 检测到人(置信度 %.2f), 待触发拍照(累计命中 %u)\n",
-                         r.person_score, (unsigned)g_ai_hit_total);
-              // 中继报警: 复用现有 cmd_ack 可靠 JSON 通道(服务端原样转发给观众), 
-              // 不引入服务端不识别的 t 类型。观众端收到 {"t":"cmd_ack","res":"AI",...}
-              // 即“检测到人”事件。res 前缀 AI 与摄像头命令回执区分。
-              if (g_ai_relay_alert && g_relay_viewer) {
-                char _al[96];
-                int _n = snprintf(_al, sizeof(_al),
-                                  "{\"t\":\"cmd_ack\",\"res\":\"AI\",\"ok\":1,"
-                                  "\"score\":%d,\"hit\":%u}",
-                                  (int)(r.person_score * 100),
-                                  (unsigned)g_ai_hit_total);
-                relay_send_payload((const uint8_t*)_al, (size_t)_n);
-                Dbg.println("[AI] 中继报警已发送");
-              }
-              g_ai_trigger_photo = true;   // 只置标志, 由下轮 loop 在不持锁时消费
-            }
+      if (g_ai_mutex && xSemaphoreTake(g_ai_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (!g_ai_inuse) {                 // ai_task 空闲才更新快照, 否则丢本帧(反正是节流)
+          if (g_ai_buf) { frame_free(g_ai_buf, g_ai_slot); g_ai_buf = NULL; }
+          uint8_t *b = frame_alloc(fb->len, &g_ai_slot);
+          if (b) {
+            memcpy(b, fb->buf, fb->len);
+            g_ai_buf = b;
+            g_ai_len = fb->len;
+            g_ai_w = fb->width; g_ai_h = fb->height; g_ai_fmt = (uint8_t)fb->format;
+            if (g_ai_signal) xSemaphoreGive(g_ai_signal);   // 唤醒 ai_task
           }
-        } else {
-          g_ai_confirm_cnt = 0;
         }
+        xSemaphoreGive(g_ai_mutex);
       }
     }
   }
