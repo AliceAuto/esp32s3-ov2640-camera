@@ -43,5 +43,8 @@ vendor/
 host/shots/
 host/photos/
 
+# ========== AI 模型权重（体积大，运行时下载） ==========
+host/models/*.onnx
+
 # ========== 本地凭据（不入库） ==========
 firmware/src/secrets.h

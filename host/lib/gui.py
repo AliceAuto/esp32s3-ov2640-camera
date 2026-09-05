@@ -15,10 +15,17 @@ from PIL import Image, ImageTk
 from lib import core
 from lib import gui_style as Gs
 from lib import watchdog as _watchdog
+from lib import detector as _det
 from lib.protocol import RES_LABELS, res_label, code_of, label_of_code
 
 ui = {}          # 控件句柄/渲染状态集中存放
 display_q = queue.Queue(maxsize=2)
+
+# 本地 YOLO 检测(后台解码线程调用)
+det = _det.Detector(conf=0.35)
+det_enabled = [True]
+det_last = [0]            # 最近一次 person 检测数
+det_crop = [0.08]         # 四周边缘裁剪比例(去暗角), 0=不裁
 
 
 def _on_watchdog_violation():
@@ -85,6 +92,15 @@ def build_ui(root):
 
     snap_btn = ttk.Button(tb, text="存图(Ctrl+S)", command=snapshot)
     snap_btn.pack(side="left")
+
+    def _toggle_det():
+        det_enabled[0] = bool(det_var.get())
+        print("AI检测 -> %s" % ("ON" if det_enabled[0] else "OFF"), flush=True)
+
+    det_var = tk.BooleanVar(value=True)
+    det_cb = ttk.Checkbutton(tb, text="AI检测", variable=det_var, command=_toggle_det)
+    det_cb.pack(side="left", padx=(12, 4))
+    ui["det_var"], ui["det_cb"] = det_var, det_cb
 
     # ---- 视频区(固定 Canvas: 画面居中适配, 不随帧变化撑动窗口) ----
     # 原用 Label 且每帧 config(width=画面宽, height=画面高): Label 的 requested
@@ -300,6 +316,21 @@ def decode_worker(stop_ev):
                 img = Image.open(io.BytesIO(raw)).convert("RGB")
             else:
                 img = Image.frombytes("RGB", (w, h), core.convert_rgb(raw, w, h))
+            # 边缘裁剪(去暗角): 裁掉四周 det_crop 比例
+            if det_crop[0] > 0:
+                iw, ih = img.size
+                cw = int(iw * (1 - 2 * det_crop[0]))
+                ch = int(ih * (1 - 2 * det_crop[0]))
+                img = img.crop(((iw - cw) // 2, (ih - ch) // 2,
+                                (iw - cw) // 2 + cw, (ih - ch) // 2 + ch))
+            # 本地 YOLO 检测画框(后台线程, 不卡 UI 主线程)
+            if det_enabled[0]:
+                try:
+                    _res = det.detect(img)
+                    img, _n = _det.draw_boxes(img, _res, target_names={"person"})
+                    det_last[0] = _n
+                except Exception as e:  # noqa: BLE001
+                    print(f"检测异常: {e}", flush=True)
             # display_q 丢旧保新: 解码慢时只保留最新一帧
             try:
                 while not display_q.empty():
@@ -375,6 +406,8 @@ def render_loop(root):
         note = ""
         if now < core.G["photo_until"]:
             note = " | 拍照中…"
+        if det_enabled[0]:
+            note += f" | 检测 {det_last[0]} 人"
         ui["info"].config(text=f"{mode} {res}  链路 {fps:5.1f} | 上屏 {fps_up:5.1f} fps  "
                                f"{kbps:4.0f} KB/s  帧计 {core.G['frames']} 丢帧 {core.G['drops']}{note}")
 
