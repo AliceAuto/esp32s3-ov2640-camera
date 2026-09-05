@@ -41,3 +41,10 @@ ai_result_t ai_detect_frame(camera_fb_t *fb);
 extern float g_ai_person_thresh;
 // 连续确认帧数: 连续 N 帧判定有人才触发一次报警(防抖)。
 extern uint8_t g_ai_confirm_frames;
+
+// 诊断: 最近一次推理的输出张量元信息(main.cpp 的 ai_task 打印, 排查分数异常用)
+extern volatile int   g_ai_out_type;   // TfLiteType
+extern volatile float g_ai_out_scale;  // 量化 scale
+extern volatile int   g_ai_out_zp;     // 量化 zero_point
+extern volatile int   g_ai_out_raw0;   // 原始 int8 值[0]
+extern volatile int   g_ai_out_raw1;   // 原始 int8 值[1]

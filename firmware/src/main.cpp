@@ -619,6 +619,14 @@ void ai_task(void *arg) {
     g_ai_last_infer_us = _t1 - _t0;
     g_ai_infer_total++;
 
+    // 诊断: 节流打印推理分数(每 5 次), 确认模型在工作; 元信息可经 Ts 查询
+    static uint32_t _ai_dbg = 0;
+    if ((++_ai_dbg % 5) == 0) {
+      Dbg.printf("[AI] inf#%u person=%.2f not=%.2f (推理 %ums)\n",
+                 (unsigned)g_ai_infer_total, r.person_score, r.not_person_score,
+                 (unsigned)(g_ai_last_infer_us / 1000));
+    }
+
     // 触发判定(防抖 + 冷却 + 中继报警 + 置拍照标志)
     if (r.ok) {
       if (r.person) {
@@ -1286,6 +1294,9 @@ void handle_cmd(int c, Stream &in) {
       Dbg.printf("AI: 累计推理=%u 命中=%u 上次推理耗时=%ums\n",
                  (unsigned)g_ai_infer_total, (unsigned)g_ai_hit_total,
                  (unsigned)(g_ai_last_infer_us / 1000));
+      Dbg.printf("AI: 输出张量 type=%d scale=%.4f zp=%d raw=%d,%d\n",
+                 (int)g_ai_out_type, (double)g_ai_out_scale, (int)g_ai_out_zp,
+                 (int)g_ai_out_raw0, (int)g_ai_out_raw1);
     } else if (sub == 'i' || sub == 'I') {
       long t1 = millis();
       while (millis() - t1 < 200 && !in.available()) delay(1);

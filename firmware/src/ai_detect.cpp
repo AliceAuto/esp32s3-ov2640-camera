@@ -44,6 +44,13 @@ static uint8_t                    *s_tensor_arena = nullptr;
 float   g_ai_person_thresh    = 0.6f;  // 人置信度阈值(0.0~1.0)
 uint8_t g_ai_confirm_frames   = 2;     // 连续确认帧数(防抖; 默认2帧/推理间隔1s=>需人持续~2s)
 
+// 诊断: 最近一次推理的输出张量元信息
+volatile int   g_ai_out_type  = -1;
+volatile float g_ai_out_scale = 0.0f;
+volatile int   g_ai_out_zp    = 0;
+volatile int   g_ai_out_raw0  = 0;
+volatile int   g_ai_out_raw1  = 0;
+
 bool ai_detect_init() {
   // 从数据映射模型(仅指针映射, 无拷贝/解析)
   s_model = tflite::GetModel(g_person_detect_model_data);
@@ -101,6 +108,7 @@ ai_result_t ai_detect_once(const uint8_t *gray96) {
   r.not_person_score = 0.0f;
 
   if (s_interpreter == nullptr || s_input == nullptr || gray96 == nullptr) {
+    g_ai_out_type = -2;   // 诊断: 解释器/输入未就绪
     return r;
   }
 
@@ -111,14 +119,25 @@ ai_result_t ai_detect_once(const uint8_t *gray96) {
   }
 
   if (s_interpreter->Invoke() != kTfLiteOk) {
+    g_ai_out_type = -3;   // 诊断: Invoke 失败
     TF_LITE_REPORT_ERROR(&s_error_reporter, "AI: Invoke 失败");
     return r;
   }
 
   TfLiteTensor *out = s_interpreter->output(0);
-  if (out == nullptr || out->dims->size < 1 || out->dims->data[0] < AI_K_CATEGORIES) {
+  // 输出形状通常为 [1, 2](batch, 类别)。这里用 bytes 检查容量, 不依赖 dims 布局假设
+  // (此前检查 data[0]<2 会误判 —— batch 维恒为 1)。
+  if (out == nullptr || out->bytes < (size_t)AI_K_CATEGORIES) {
+    g_ai_out_type = -4;   // 诊断: 输出张量无效
     return r;
   }
+
+  // 诊断: 记录输出张量元信息 + 原始值(由 ai_task 打印)
+  g_ai_out_type  = (int)out->type;
+  g_ai_out_scale = out->params.scale;
+  g_ai_out_zp    = (int)out->params.zero_point;
+  g_ai_out_raw0  = (int)out->data.int8[0];
+  g_ai_out_raw1  = (int)out->data.int8[1];
 
   // int8 量化输出 -> float(按模型输出 zero_point/scale 还原)
   r.person_score =
