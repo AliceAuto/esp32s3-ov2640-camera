@@ -27,6 +27,7 @@
 #include "web_cfg.h"        // Web 配置页 + NVS
 #include "wifi_sta.h"       // WiFi STA 接入
 #include "led.h"            // 板载 RGB 状态灯
+#include "ai_detect.h"      // 人体检测(Person Detection)
 
 // ---- 函数原型（.ino 由 Arduino 自动生成，.cpp 需手动声明）----
 void handle_cmd(int c, Stream &in);
@@ -446,6 +447,13 @@ void setup() {
   g_cam_ready = true;
   apply_color_calib();
   log_i("CAM init ok");
+
+  // 人体检测模型: 相机就绪后加载一次。阶段1只验证"模型能加载+真实占用",
+  // 采集/推理调度在阶段2接入。
+  if (ai_detect_init())
+    Dbg.println("[AI] 人体检测模型就绪");
+  else
+    Dbg.println("[AI] 人体检测模型初始化失败(不影响推流)");
 
 #ifdef ENABLE_WIFI
   setup_wifi();
