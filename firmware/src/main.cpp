@@ -504,11 +504,12 @@ void setup() {
   xTaskCreatePinnedToCore(disc_task,  "disc",  2048, NULL, 1, NULL, 0); // 局域网发现广播
   xTaskCreatePinnedToCore(relay_task, "relay", 3072, NULL, 1, NULL, 0); // 跨网中继(常驻)
   xTaskCreatePinnedToCore(diag_beat_task, "diagb", 3072, NULL, 1, NULL, 0); // UDP 诊断心跳(核0)
-  // 人体检测后台推理: 独立任务, 采集循环只喂快照不阻塞。推理慢(库无 ESP-NN 优化
-  // 约 4s/帧)也无妨 —— 挂核1 优先级0(最低), 只在 loopTask 等帧/DMA 的空闲时间跑。
+  // 人体检测后台推理: 独立任务, 采集循环只喂快照不阻塞。挂核0 优先级0(最低):
+  // 核1 留给采集+控制(不抢 DMA/loopTask), 核0 上 sender(3)/relay(1) 均可抢占,
+  // 网络发送不受影响; 推理在核0 空闲时间跑(慢但无妨)。
   g_ai_mutex  = xSemaphoreCreateMutex();
   g_ai_signal = xSemaphoreCreateCounting(4, 0);
-  xTaskCreatePinnedToCore(ai_task, "ai", 8192, NULL, 0, NULL, 1);
+  xTaskCreatePinnedToCore(ai_task, "ai", 8192, NULL, 0, NULL, 0);
   g_diag_last_ms = millis();
   g_adapt_last_ms = millis();
   log_i("CAM setup done, tasks up");
@@ -1267,7 +1268,7 @@ void handle_cmd(int c, Stream &in) {
     //   Tt<0-100> 人置信度阈值(%)
     //   Tf<1-10>  连续确认帧数(防抖)
     //   Tc<0-255> 触发冷却(秒)
-    //   Ti<200-60000> 推理间隔(ms)
+    //   Ti<1-255> 推理间隔(秒)
     //   Tm      切换中继报警
     long t0 = millis();
     while (millis() - t0 < 200 && !in.available()) delay(1);
@@ -1277,10 +1278,10 @@ void handle_cmd(int c, Stream &in) {
     }
     char sub = (char)in.read();
     if (sub == 's' || sub == 'S') {
-      Dbg.printf("AI: 阈值=%.0f%% 确认帧=%u 冷却=%us 推理间隔=%ums 中继报警=%s\n",
+      Dbg.printf("AI: 阈值=%.0f%% 确认帧=%u 冷却=%us 推理间隔=%us 中继报警=%s\n",
                  g_ai_person_thresh * 100, (unsigned)g_ai_confirm_frames,
                  (unsigned)(g_ai_cooldown_ms / 1000),
-                 (unsigned)g_ai_infer_interval_ms,
+                 (unsigned)(g_ai_infer_interval_ms / 1000),
                  g_ai_relay_alert ? "ON" : "OFF");
       Dbg.printf("AI: 累计推理=%u 命中=%u 上次推理耗时=%ums\n",
                  (unsigned)g_ai_infer_total, (unsigned)g_ai_hit_total,
@@ -1288,12 +1289,12 @@ void handle_cmd(int c, Stream &in) {
     } else if (sub == 'i' || sub == 'I') {
       long t1 = millis();
       while (millis() - t1 < 200 && !in.available()) delay(1);
-      if (!in.available()) { Dbg.println("Ti 缺间隔ms"); return; }
+      if (!in.available()) { Dbg.println("Ti 缺间隔秒"); return; }
       int v = in.read();
-      if (v >= 200 && v <= 60000) {
-        g_ai_infer_interval_ms = (uint32_t)v;
-        Dbg.printf("AI 推理间隔=%ums\n", v);
-      } else Dbg.println("Ti 间隔须 200-60000ms");
+      if (v >= 1 && v <= 255) {
+        g_ai_infer_interval_ms = (uint32_t)v * 1000;
+        Dbg.printf("AI 推理间隔=%us\n", v);
+      } else Dbg.println("Ti 间隔须 1-255 秒");
     } else if (sub == 't' || sub == 'T') {
       long t1 = millis();
       while (millis() - t1 < 200 && !in.available()) delay(1);
