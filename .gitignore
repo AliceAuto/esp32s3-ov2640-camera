@@ -23,6 +23,7 @@ firmware/.pio/libdeps/
 *.avi
 
 # ========== Python 产物 ==========
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -48,3 +49,6 @@ host/models/*.onnx
 
 # ========== 本地凭据（不入库） ==========
 firmware/src/secrets.h
+
+# ========== 与本项目无关的本地资料（误放目录，不入库） ==========
+27李林*/

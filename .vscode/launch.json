@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "主机端: 协议自检",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/host/main.py",
+            "args": ["--selftest"],
+            "cwd": "${workspaceFolder}/host",
+            "env": {"PYTHONPATH": "${workspaceFolder}/host"},
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "中继服务端",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/server/relay_server.py",
+            "args": ["8001"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "固件: ESP32-S3 调试",
+            "type": "platformio-debug",
+            "request": "launch",
+            "projectEnvName": "esp32s3",
+            "preLaunchTask": "固件: 编译"
+        }
+    ]
+}

@@ -1,0 +1,47 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "固件: 编译",
+            "type": "shell",
+            "command": "pio",
+            "args": ["run", "--project-dir", "${workspaceFolder}/firmware"],
+            "problemMatcher": [],
+            "group": {"kind": "build", "isDefault": true}
+        },
+        {
+            "label": "固件: 编译并烧录",
+            "type": "shell",
+            "command": "pio",
+            "args": ["run", "--project-dir", "${workspaceFolder}/firmware", "-t", "upload"],
+            "problemMatcher": []
+        },
+        {
+            "label": "固件: 串口监视器",
+            "type": "shell",
+            "command": "pio",
+            "args": ["device", "monitor", "--project-dir", "${workspaceFolder}/firmware"],
+            "problemMatcher": []
+        },
+        {
+            "label": "主机端: 协议自检",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "args": ["main.py", "--selftest"],
+            "options": {
+                "cwd": "${workspaceFolder}/host",
+                "env": {"PYTHONPATH": "${workspaceFolder}/host"}
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "服务端: 启动中继",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "args": ["server/relay_server.py", "8001"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "isBackground": true,
+            "problemMatcher": []
+        }
+    ]
+}

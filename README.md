@@ -40,13 +40,27 @@ ov2640/
 
 ## 快速开始
 
+### 初始化开发环境
+
+仓库已提供 VS Code 工作区配置。首次使用时，在仓库根目录执行：
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+推荐安装扩展：PlatformIO IDE、Python、Pylance、C/C++。打开仓库后，可直接运行 VS Code 任务“主机端: 协议自检”或“固件: 编译”。
+
 ### 编译 / 烧录固件（PlatformIO）
 
 ```bash
 cd firmware
 pio run                 # 编译
-pio run -t upload       # 烧录（platformio.ini: upload_port = COM7）
+pio run -t upload       # 自动探测并烧录已连接的开发板
+pio run -t upload --upload-port COM7  # 需要时手动指定串口
 ```
+
+在 VS Code 中选择“固件: ESP32-S3 调试”可启动 PlatformIO 调试。该功能需要支持 JTAG 的 ESP32-S3 调试器或板载 USB-JTAG；仅连接普通串口时可烧录和看日志，但不能断点调试。
 
 ### 运行预览
 

@@ -1,0 +1,6 @@
+numpy>=1.26,<3
+Pillow>=10.0,<13
+onnx>=1.15,<2
+onnxruntime>=1.17,<2
+pyserial>=3.5,<4
+debugpy>=1.8,<2
