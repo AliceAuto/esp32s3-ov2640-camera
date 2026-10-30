@@ -18,7 +18,7 @@ from lib import rgb565 as _rgb565
 TRANSPORT = "lan"              # relay=强制中继; lanrelay=局域网优先回退; lan=仅局域网
 HOST = "192.168.4.1"
 PORT = 3333
-RELAY_SPEC = "8.148.79.85:8001"
+RELAY_SPEC = ""                # 中继服务端 "host:port"(由 main.py 从 --relay 写入)
 DEV_ID = None
 RES_CODE = "t"                 # 当前预览分辨率码(GUI 下拉选择为准)
 RECONNECT_AFTER = 4.0          # 预览停流超此秒数 -> TCP 重连并重下发命令

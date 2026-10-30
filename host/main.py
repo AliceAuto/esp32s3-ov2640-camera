@@ -50,7 +50,9 @@ elif "--lanrelay" in sys.argv:
 else:
     TRANSPORT = "lan"
 # 中继服务端 "host:port", 仅在 relay/lanrelay 用
-_RELAY_SPEC = _fv("--relay") or "8.148.79.85:8001"
+_RELAY_SPEC = _fv("--relay") or ""
+if TRANSPORT in ("relay", "lanrelay") and not _RELAY_SPEC:
+    sys.exit("需要中继地址: python main.py --relay <host:port> --id <设备ID>")
 _ID = _fv("--id")
 # 纯位置参数(去掉所有 --flag 及其取值)
 _skip = _FLAGS + tuple(v for v in (_ID,) if v)

@@ -42,7 +42,7 @@
 #define AP_PASS     ""
 #define TCP_PORT    3333
 #define DISCOVERY_PORT  9999
-#define RELAY_HOST_DEFAULT "8.148.79.85:8001"   // 未配置时默认连接的公网中继服务端(空=关闭)
+#define RELAY_HOST_DEFAULT ""                  // 公网中继地址(如 "host:8001"; 空=关闭), 也可在配网页填写
 #ifndef RELAY_TOKEN
 #define RELAY_TOKEN ""                          // 中继鉴权口令, secrets.h 可覆盖(与服务器一致)
 #endif

@@ -68,10 +68,10 @@ pio run -t upload --upload-port COM7  # 需要时手动指定串口
 cd host
 
 # 跨网中继观看（推荐，需云中继在线）
-python main.py --relay 8.148.79.85:8001 --id cam-1DCD23D8
+python main.py --relay <你的中继地址>:8001 --id cam-0001
 
 # 局域网 WiFi（TCP 可靠 / UDP 高帧率）
-python main.py --wifi 192.168.10.118 3333
+python main.py --wifi <摄像头IP> 3333
 
 # 局域网优先，失败自动回退中继
 python main.py --lanrelay

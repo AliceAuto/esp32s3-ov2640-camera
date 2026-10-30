@@ -6,7 +6,7 @@
 import sys, time, threading, socket, json, re, serial
 
 SER = sys.argv[1] if len(sys.argv) > 1 else "COM10"
-HOST = sys.argv[2] if len(sys.argv) > 2 else "8.148.79.85"
+HOST = sys.argv[2] if len(sys.argv) > 2 else "relay.example.com"
 PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8001
 DEV = sys.argv[4] if len(sys.argv) > 4 else "cam-1DCD23D8"
 SECS = int(sys.argv[5]) if len(sys.argv) > 5 else 15

@@ -3,7 +3,7 @@
 """公网中继全链路 e2e: 真实服务器上 摄像头reg + 观众list/watch + 双向字节中继。"""
 import socket, json, sys
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "8.148.79.85"
+HOST = sys.argv[1] if len(sys.argv) > 1 else "relay.example.com"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8001
 
 def sendmsg(s, b):

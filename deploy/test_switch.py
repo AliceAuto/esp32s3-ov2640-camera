@@ -6,7 +6,7 @@
 """
 import socket, json, time, sys
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "8.148.79.85"
+HOST = sys.argv[1] if len(sys.argv) > 1 else "relay.example.com"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8001
 DEV  = sys.argv[3] if len(sys.argv) > 3 else "cam-1DCD23D8"
 

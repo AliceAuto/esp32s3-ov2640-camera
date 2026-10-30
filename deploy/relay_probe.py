@@ -3,7 +3,7 @@
 """跨网观看探针: 以观众身份连中继, watch 真实摄像头, 连收几帧校验视频能流下来。"""
 import socket, json, sys
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "8.148.79.85"
+HOST = sys.argv[1] if len(sys.argv) > 1 else "relay.example.com"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8001
 DEV = sys.argv[3] if len(sys.argv) > 3 else "cam-1DCD23D8"
 FRAMES = int(sys.argv[4]) if len(sys.argv) > 4 else 5

@@ -3,7 +3,7 @@
 """定时帧率计数器: 以观众身份连中继 watch 摄像头, 统计 N 秒内收到的完整视频帧数与吞吐。"""
 import socket, json, sys, time
 
-HOST  = sys.argv[1] if len(sys.argv) > 1 else "8.148.79.85"
+HOST  = sys.argv[1] if len(sys.argv) > 1 else "relay.example.com"
 PORT  = int(sys.argv[2]) if len(sys.argv) > 2 else 8001
 DEV   = sys.argv[3] if len(sys.argv) > 3 else "cam-1DCD23D8"
 DUR   = float(sys.argv[4]) if len(sys.argv) > 4 else 12.0
