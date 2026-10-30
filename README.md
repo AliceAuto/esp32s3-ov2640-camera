@@ -18,7 +18,7 @@
 ## 仓库结构
 
 ```
-ov2640/
+esp32s3-ov2640-camera/
 ├── firmware/                    # 固件（PlatformIO，源码编译 esp32-camera，解锁 JPEG）
 │   └── src/main.cpp             # 固件主体
 ├── host/                        # 上位机（入口 main.py + 模块库 lib/）
